@@ -68,7 +68,7 @@ class ServerArgs:
     # Port for the HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
-    worker_num: int = 1
+    tokenizer_worker_num: int = 1
     nccl_port: Optional[int] = None
 
     # Memory and scheduling
@@ -604,10 +604,10 @@ class ServerArgs:
             help="The port for NCCL distributed environment setup. Defaults to a random port.",
         )
         parser.add_argument(
-            "--worker-num",
+            "--tokenizer-worker-num",
             type=int,
-            default=ServerArgs.worker_num,
-            help="The worker num of the server.",
+            default=ServerArgs.tokenizer_worker_num,
+            help="The worker num of the tokenizer manager.",
         )
         parser.add_argument(
             "--tokenizer-mode",
@@ -1746,10 +1746,7 @@ class PortArgs:
     # The ipc filename for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_ipc_name: str
 
-    # The port for 
-    
-    
-    initialization (torch.dist)
+    # The port for initialization (torch.dist)
     nccl_port: int
 
     # The ipc filename for rpc call between Engine and Scheduler
@@ -1817,7 +1814,7 @@ class PortArgs:
                 metrics_ipc_name=f"tcp://{dist_init_host}:{port_base + 3}",
                 tokenizer_worker_ipc_name=None,
             )
-        if server_args.worker_num > 1:
+        if server_args.tokenizer_worker_num > 1:
             port_args.tokenizer_worker_ipc_name = (
                 f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
             )

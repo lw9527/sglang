@@ -339,7 +339,7 @@ async def lifespan(fast_api_app: FastAPI):
             _global_state.tokenizer_manager
         )
 
-        logger.info(f"mapping_length={mapping_len},worker_num={server_args.worker_num}")
+        logger.info(f"mapping_length={mapping_len},tokenizer_worker_num={server_args.tokenizer_worker_num}")
         # Check if all workers have registered
 
         if server_args.warmups is not None:
@@ -355,7 +355,6 @@ async def lifespan(fast_api_app: FastAPI):
         logger.info("warmup_thread start")
 
         # Create a warmup thread for each worker
-        # if mapping_len == server_args.worker_num:
         warmup_thread = threading.Thread(
             target=_wait_and_warmup,
             args=(
@@ -372,7 +371,7 @@ async def lifespan(fast_api_app: FastAPI):
     try:
         yield
     finally:
-        if server_args.worker_num > 1:
+        if server_args.tokenizer_worker_num > 1:
             logger.info(f"worker {pid} ending")
             # Clean up shared memory
             try:
@@ -1142,7 +1141,7 @@ def launch_server(
             scheduler_info=scheduler_info,
         )
     )
-    if server_args.worker_num > 1:
+    if server_args.tokenizer_worker_num > 1:
         # get main process ID
         main_pid = get_main_process_id()
         current_pid = os.getpid()
@@ -1202,7 +1201,7 @@ def launch_server(
         set_uvicorn_logging_configs()
         app.server_args = server_args
         # Listen for HTTP requests
-        if server_args.worker_num > 1:
+        if server_args.tokenizer_worker_num > 1:
             uvicorn.run(
                 "sglang.srt.entrypoints.http_server:app",
                 host=server_args.host,
@@ -1210,7 +1209,7 @@ def launch_server(
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=5,
                 loop="uvloop",
-                workers=server_args.worker_num,
+                workers=server_args.tokenizer_worker_num,
             )
         else:
             uvicorn.run(
@@ -1222,7 +1221,7 @@ def launch_server(
                 loop="uvloop",
             )
     finally:
-        if server_args.worker_num > 1:
+        if server_args.tokenizer_worker_num > 1:
             port_args_shm.unlink()
             server_args_shm.unlink()
             scheduler_info_shm.unlink()

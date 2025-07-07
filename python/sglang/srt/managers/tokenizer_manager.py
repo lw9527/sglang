@@ -200,7 +200,7 @@ class TokenizerManager:
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
-        if server_args.worker_num > 1:
+        if server_args.tokenizer_worker_num > 1:
             if self.is_main:
                 self.send_to_scheduler = get_zmq_socket(
                     context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
@@ -1410,13 +1410,13 @@ class TokenizerManager:
 
     async def handle_loop(self):
         """The event loop that handles requests"""
-        if self.server_args.worker_num > 1 and self.is_main:
+        if self.server_args.tokenizer_worker_num > 1 and self.is_main:
             self._load_tokenizer_mapping()
 
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             # In multi-worker mode, distribute results to corresponding workers
-            if self.server_args.worker_num > 1 and self.is_main:
+            if self.server_args.tokenizer_worker_num > 1 and self.is_main:
                 await self._distribute_result_to_workers(recv_obj)
             else:
                 # In single worker mode, process directly
@@ -1442,7 +1442,7 @@ class TokenizerManager:
                 )
 
                 # Check if worker count matches
-                if len(ipc_mapping) >= self.server_args.worker_num:
+                if len(ipc_mapping) >= self.server_args.tokenizer_worker_num:
                     # Initialize tokenizer_mapping if not exists
                     if not hasattr(self, "tokenizer_mapping"):
                         self.tokenizer_mapping = {}
@@ -1469,14 +1469,14 @@ class TokenizerManager:
                     break  # Successfully loaded all workers, exit retry loop
                 else:
                     logger.info(
-                        f"Waiting for all workers to register... Current: {len(ipc_mapping)}/{self.server_args.worker_num}"
+                        f"Waiting for all workers to register... Current: {len(ipc_mapping)}/{self.server_args.tokenizer_worker_num}"
                     )
                     if retry < max_retries - 1:
                         time.sleep(retry_interval)
                     else:
                         raise RuntimeError(
                             f"Worker registration timeout. "
-                            f"Expected worker count: {self.server_args.worker_num}, "
+                            f"Expected worker count: {self.server_args.tokenizer_worker_num}, "
                             f"Current registered count: {len(ipc_mapping)}"
                         )
             except Exception as e:
@@ -2172,7 +2172,7 @@ class _Communicator(Generic[T]):
         if obj:
             if (
                 self._server_args
-                and self._server_args.worker_num > 1
+                and self._server_args.tokenizer_worker_num > 1
                 and obj.rids is None
             ):
                 obj.rids = f"{os.getpid()}_{uuid.uuid4().hex}_Communicator"

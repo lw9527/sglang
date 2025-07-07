@@ -112,7 +112,7 @@ class DetokenizerManager:
 
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
         self.is_dummy = server_args.load_format == "dummy"
-        self.worker_num = server_args.worker_num
+        self.tokenizer_worker_num = server_args.tokenizer_worker_num
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (BatchEmbeddingOut, self.handle_batch_embedding_out),
@@ -123,14 +123,14 @@ class DetokenizerManager:
 
     def event_loop(self):
         """The event loop that handles requests"""
-        if self.worker_num > 1:
+        if self.tokenizer_worker_num > 1:
             self._load_tokenizer_mapping()
 
         while True:
             try:
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
                 output = self._request_dispatcher(recv_obj)
-                if self.worker_num <= 1:
+                if self.tokenizer_worker_num <= 1:
                     self.send_to_tokenizer.send_pyobj(output)
                 else:
                     # Extract worker_id from rid
@@ -298,7 +298,7 @@ class DetokenizerManager:
             except Exception as e:
                 logger.error(f"Error in detokenizer event loop: {e}")
                 # If it's a ZMQ error, try to reload mapping
-                if "ZMQ" in str(e) and self.worker_num > 1:
+                if "ZMQ" in str(e) and self.tokenizer_worker_num > 1:
                     logger.info(
                         "ZMQ error detected, attempting to reload tokenizer mapping..."
                     )
@@ -322,7 +322,7 @@ class DetokenizerManager:
                 logger.info(f"Detokenizer loaded tokenizer mapping: {ipc_mapping}")
 
                 # Check if worker count matches
-                if len(ipc_mapping) >= self.worker_num:
+                if len(ipc_mapping) >= self.tokenizer_worker_num:
                     # Initialize tokenizer_mapping if not exists
                     if not hasattr(self, "tokenizer_mapping"):
                         self.tokenizer_mapping = {}
@@ -349,14 +349,14 @@ class DetokenizerManager:
                     break  # Successfully loaded all workers, exit retry loop
                 else:
                     logger.info(
-                        f"Waiting for all workers to register... Current: {len(ipc_mapping)}/{self.worker_num}"
+                        f"Waiting for all workers to register... Current: {len(ipc_mapping)}/{self.tokenizer_worker_num}"
                     )
                     if retry < max_retries - 1:
                         time.sleep(retry_interval)
                     else:
                         raise RuntimeError(
                             f"Worker registration timeout. "
-                            f"Expected worker count: {self.worker_num}, "
+                            f"Expected worker count: {self.tokenizer_worker_num}, "
                             f"Current registered count: {len(ipc_mapping)}"
                         )
             except Exception as e:
