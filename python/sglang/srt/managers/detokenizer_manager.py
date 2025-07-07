@@ -137,7 +137,7 @@ class DetokenizerManager:
                     if isinstance(recv_obj.rids, list):
                         worker_ids = [int(rid.split("_")[0]) for rid in recv_obj.rids]
                     else:
-                        raise RuntimeError(f"recv_obj.rids is not list")
+                        raise RuntimeError(f"tokenizer_worker_num > 1, recv_obj.rids must be list")
 
                     # Send data using the corresponding socket
                     for i, worker_id in enumerate(worker_ids):
@@ -151,7 +151,7 @@ class DetokenizerManager:
                             # Create a new output object based on the type
                             if isinstance(output, BatchEmbeddingOut):
                                 new_output = BatchEmbeddingOut(
-                                    rids=[output.rids.split("_")[0]],
+                                    rids=[output.rids[i]],
                                     finished_reasons=[output.finished_reasons[i]],
                                     embeddings=[output.embeddings[i]],
                                     prompt_tokens=[output.prompt_tokens[i]],

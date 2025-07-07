@@ -406,6 +406,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Function to setup all middlewares for multi-process compatibility
+def setup_middlewares():
+    """Setup all middlewares for both single and multi-process modes"""
+    worker_pid = os.getpid()
+
+    # Setup API key middleware
+    api_key = os.environ.get("SGLANG_API_KEY", "")
+    if api_key:
+        add_api_key_middleware(app, api_key)
+        logger.info(f"Worker {worker_pid} added API key middleware")
+
+    # Setup prometheus middleware
+    # Check if metrics are enabled via environment variable
+    enable_metrics = get_bool_env_var("SGLANG_ENABLE_METRICS", "false")
+    if enable_metrics:
+        add_prometheus_middleware(app)
+        enable_func_timer()
+        logger.info(f"Worker {worker_pid} added prometheus middleware")
+
+# Call setup function at module level for multi-process compatibility
+setup_middlewares()
+
 
 # Custom exception handlers to change validation error status codes
 @app.exception_handler(RequestValidationError)
@@ -1187,14 +1209,22 @@ def launch_server(
         )
         app.warmup_thread = warmup_thread
 
-    # Add api key authorization
-    if server_args.api_key:
-        add_api_key_middleware(app, server_args.api_key)
+    if server_args.tokenizer_worker_num > 1:
+        # Set environment variables for middlewares in main process
+        if server_args.api_key:
+            os.environ["SGLANG_API_KEY"] = server_args.api_key
+            logger.info("Main process set SGLANG_API_KEY")
 
-    # Add prometheus middleware
-    if server_args.enable_metrics:
-        add_prometheus_middleware(app)
-        enable_func_timer()
+        if server_args.enable_metrics:
+            os.environ["SGLANG_ENABLE_METRICS"] = "true"
+            logger.info("Main process set SGLANG_ENABLE_METRICS=true")
+    else:
+        if server_args.api_key:
+            add_api_key_middleware(app,server_args.api_key)
+
+        if server_args.enable_metrics:
+            add_prometheus_middleware(app)
+            enable_func_timer()
 
     try:
         # Update logging configs

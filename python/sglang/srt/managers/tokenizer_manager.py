@@ -484,13 +484,14 @@ class TokenizerManager:
 
         obj.normalize_batch_and_arguments()
 
-        # Modify rid, add worker_id
-        if isinstance(obj.rid, list):
-            # If it's an array, add worker_id prefix to each element
-            obj.rid = [f"{self.worker_id}_{rid}" for rid in obj.rid]
-        else:
-            # If it's a single value, add worker_id prefix
-            obj.rid = f"{self.worker_id}_{obj.rid}"
+        if self.server_args.tokenizer_worker_num > 1:
+            # Modify rid, add worker_id
+            if isinstance(obj.rid, list):
+                # If it's an array, add worker_id prefix to each element
+                obj.rid = [f"{self.worker_id}_{rid}" for rid in obj.rid]
+            else:
+                # If it's a single value, add worker_id prefix
+                obj.rid = f"{self.worker_id}_{obj.rid}"
 
         if isinstance(obj, GenerateReqInput):
             return_hidden_states = obj.return_hidden_states
@@ -1699,10 +1700,12 @@ class TokenizerManager:
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
                 continue
-
+            originRid = rid
+            if self.server_args.tokenizer_worker_num > 1:
+                originRid = rid.split("_", 1)[1]
             # Build meta_info and return value
             meta_info = {
-                "id": rid,
+                "id": originRid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
             }
@@ -1987,12 +1990,15 @@ class TokenizerManager:
 
     def _handle_abort_req(self, recv_obj):
         state = self.rid_to_state[recv_obj.rid]
+        rid = recv_obj.rid
+        if self.server_args.tokenizer_worker_num > 1:
+            rid = rid.split("_", 1)[1] if "_" in rid else rid
         state.finished = True
         state.out_list.append(
             {
                 "text": "",
                 "meta_info": {
-                    "id": recv_obj.rid,
+                    "id": rid,
                     "finish_reason": {
                         "type": "abort",
                         "message": "Abort before prefill",
@@ -2170,12 +2176,14 @@ class _Communicator(Generic[T]):
             assert self._result_values is None
 
         if obj:
-            if (
-                self._server_args
-                and self._server_args.tokenizer_worker_num > 1
-                and obj.rids is None
-            ):
-                obj.rids = f"{os.getpid()}_{uuid.uuid4().hex}_Communicator"
+            if self._server_args and self._server_args.tokenizer_worker_num > 1:
+                if obj.rids is None:
+                    obj.rids = f"{os.getpid()}_{uuid.uuid4().hex}_Communicator"
+                else:
+                    if isinstance(obj.rids, str):
+                        obj.rids = f"{os.getpid()}_{obj.rids}"
+                    elif isinstance(obj.rids, list):
+                        obj.rids = [f"{os.getpid()}_{rid}" for rid in obj.rids]
             self._sender.send_pyobj(obj)
 
         self._result_event = asyncio.Event()
@@ -2190,6 +2198,14 @@ class _Communicator(Generic[T]):
         return result_values
 
     def handle_recv(self, recv_obj: T):
+        if self._server_args and self._server_args.tokenizer_worker_num > 1:
+            # If rids is a string and not empty, remove the prefix
+            if hasattr(recv_obj, 'rids') and isinstance(recv_obj.rids, str) and recv_obj.rids:
+                recv_obj.rids = recv_obj.rids.split("_", 1)[1] if "_" in recv_obj.rids else recv_obj.rids
+            # If rids is a list, remove prefix from each element
+            elif hasattr(recv_obj, 'rids') and isinstance(recv_obj.rids, list):
+                recv_obj.rids = [rid.split("_", 1)[1] if "_" in rid else rid for rid in recv_obj.rids]
+
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
             self._result_event.set()
