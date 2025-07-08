@@ -93,7 +93,46 @@ logger = logging.getLogger(__name__)
 show_time_cost = False
 time_infos = {}
 
+#########################
+# Constants & Enums
+#########################
+class ServerStatus(Enum):
+    Up = "Up"
+    Starting = "Starting"
+    Crashed = "Crashed"
+
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
+
+_warned_bool_env_var_keys = set()
+
+def report_health(status: ServerStatus, host: str,  http_port: int, msg: str=""):
+    requests.post(f"http://{host}:{http_port}/health", json={"status": status.value, "msg": msg})
+
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
+    value = value.lower()
+
+    truthy_values = ("true", "1")
+    falsy_values = ("false", "0")
+
+    if (value not in truthy_values) and (value not in falsy_values):
+        if value not in _warned_bool_env_var_keys:
+            logger.warning(
+                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+            )
+        _warned_bool_env_var_keys.add(value)
+
+    return value in truthy_values
+
+
+def get_int_env_var(name: str, default: int = 0) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
