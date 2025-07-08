@@ -74,7 +74,7 @@ from sglang.srt.utils import (
     maybe_set_triton_cache_manager,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
-    set_ulimit,
+    set_ulimit, report_health, ServerStatus,
 )
 from sglang.version import __version__
 
@@ -660,6 +660,7 @@ def _set_envs_and_config(server_args: ServerArgs):
             logger.warning(
                 f"Child process unexpectedly failed with {exitcode=}. {pid=}"
             )
+            report_health(ServerStatus.Crashed, server_args.host, ServerArgs.port)
 
     signal.signal(signal.SIGCHLD, sigchld_handler)
 
@@ -670,6 +671,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         logger.error(
             "Received sigquit from a child process. It usually means the child failed."
         )
+        report_health(ServerStatus.Crashed, server_args.host, ServerArgs.port)
         kill_process_tree(os.getpid())
 
     signal.signal(signal.SIGQUIT, sigquit_handler)
