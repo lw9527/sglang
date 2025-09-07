@@ -122,7 +122,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.scheduler import is_health_check_generate_req
+from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -2147,6 +2147,7 @@ class _Communicator(Generic[T]):
     """Note: The communicator now only run up to 1 in-flight request at any time."""
 
     enable_multi_tokenizer = False
+    tokenizer_worker_id = 0
 
     def __init__(self, sender, fan_out: int):
         self._sender = sender
@@ -2165,7 +2166,7 @@ class _Communicator(Generic[T]):
 
         if obj:
             if _Communicator.enable_multi_tokenizer:
-                obj = MultiTokenizerWarpper(worker_id=os.getpid(), obj=obj)
+                obj = MultiTokenizerWarpper(worker_id=_Communicator.tokenizer_worker_id, obj=obj)
             self._sender.send_pyobj(obj)
 
         self._result_event = asyncio.Event()

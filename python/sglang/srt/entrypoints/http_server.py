@@ -100,6 +100,8 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     get_main_process_id,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
+    init_shared_resources,
+    get_current_tokenzier_worker_id
 )
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
@@ -173,7 +175,9 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     # Launch multi-tokenizer manager process
-    tokenizer_manager = MultiTokenizerManager(server_args, port_args)
+    tokenizer_worker_id = get_current_tokenzier_worker_id()
+    logger.info(f"current tokenizer_worker_id: {tokenizer_worker_id}")
+    tokenizer_manager = MultiTokenizerManager(server_args, port_args,tokenizer_worker_id)
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
@@ -1176,6 +1180,7 @@ def launch_server(
         tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args, port_args=port_args
         )
+        init_shared_resources()
     else:
         setproctitle.setproctitle(f"sglang::http_server/tokenizer_manager")
         tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(

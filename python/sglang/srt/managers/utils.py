@@ -140,3 +140,6 @@ class DPBalanceMeta:
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._manager = None
+
+def is_health_check_generate_req(recv_req):
+    return getattr(recv_req, "rid", "").startswith("HEALTH_CHECK")

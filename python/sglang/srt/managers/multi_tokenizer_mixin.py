@@ -14,6 +14,7 @@
 """MultiTokenizerMixin is a class that provides nesscary methods for MultiTokenizerManager and DetokenizerManager."""
 import asyncio
 import dataclasses
+import fcntl
 import json
 import logging
 import multiprocessing as multiprocessing
@@ -22,6 +23,7 @@ import sys
 import threading
 from multiprocessing import shared_memory
 from typing import Dict
+from pathlib import Path
 
 import setproctitle
 import zmq
@@ -341,14 +343,6 @@ class MultiTokenizerMixin:
             new_output = output
         return new_output
 
-    def get_worker_ids_from_req_rids(self, rids):
-        if isinstance(rids, list):
-            worker_ids = [int(rid.split("_")[0]) for rid in rids]
-        elif isinstance(rids, str):
-            worker_ids = [int(rids.split("_")[0])]
-        else:
-            worker_ids = []
-        return worker_ids
 
     def multi_tokenizer_manager_event_loop(self):
         """The event loop that handles requests, for multi tokenizer manager mode only"""
@@ -360,7 +354,7 @@ class MultiTokenizerMixin:
                 continue
             # Extract worker_id from rid
             if isinstance(recv_obj.rids, list):
-                worker_ids = self.get_worker_ids_from_req_rids(recv_obj.rids)
+                worker_ids = get_worker_ids_from_req_rids(recv_obj.rids)
             else:
                 raise RuntimeError(
                     f"for tokenizer_worker_num > 1, recv_obj.rids must be a list"
@@ -445,7 +439,7 @@ class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
             worker_ids = [recv_obj.worker_id]
             recv_obj = recv_obj.obj
         else:
-            worker_ids = self.get_worker_ids_from_req_rids(recv_obj.rids)
+            worker_ids = get_worker_ids_from_req_rids(recv_obj.rids)
 
         if len(worker_ids) == 0:
             logger.error(f"Cannot find worker_id from rids {recv_obj.rids}")
@@ -468,7 +462,6 @@ class MultiTokenizerRouter(TokenizerManager, MultiTokenizerMixin):
                 new_recv_obj = self._handle_output_by_index(recv_obj, i)
                 self.tokenizer_mapping[worker_id].send_pyobj(new_recv_obj)
 
-
 class MultiTokenizerManager(TokenizerManager, MultiTokenizerMixin):
     """Multi Process Tokenizer Manager that tokenizes the text."""
 
@@ -476,6 +469,7 @@ class MultiTokenizerManager(TokenizerManager, MultiTokenizerMixin):
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        tokenizer_worker_id: int =0,
     ):
         setproctitle.setproctitle(
             f"sglang::http_server/multi_tokenizer_manager:{os.getpid()}"
@@ -485,7 +479,7 @@ class MultiTokenizerManager(TokenizerManager, MultiTokenizerMixin):
         server_args.disaggregation_mode = "null"
         super().__init__(server_args, port_args)
 
-        self.worker_id = os.getpid()
+        self.worker_id = tokenizer_worker_id
         self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
         # For PD disaggregtion
@@ -514,8 +508,59 @@ class MultiTokenizerManager(TokenizerManager, MultiTokenizerMixin):
         req = MultiTokenizerRegisterReq(rids=[f"{self.worker_id}_register"])
         req.ipc_name = self.tokenizer_ipc_name
         _Communicator.enable_multi_tokenizer = True
+        _Communicator.tokenizer_worker_id = self.worker_id
         await self.register_multi_tokenizer_communicator(req)
 
+def get_worker_ids_from_req_rids(rids):
+        if isinstance(rids, list):
+            worker_ids = [int(rid.split("_")[0]) for rid in rids]
+        elif isinstance(rids, str):
+            worker_ids = [int(rids.split("_")[0])]
+        else:
+            worker_ids = []
+        return worker_ids
+
+# share var file
+SHARE_DETOKENIZER_COUNTER_FILE = "shared_detokenizer_counter.json"
+# lock file
+SHARE_DETOKENIZER_LOCK_FILE = "shared_detokenizer_counter.lock"
+def init_shared_resources():
+    # remove old file if exists
+    if os.path.exists(SHARE_DETOKENIZER_COUNTER_FILE):
+        os.remove(SHARE_DETOKENIZER_COUNTER_FILE)
+        print(f"remove old file: {SHARE_DETOKENIZER_COUNTER_FILE}")
+    
+    # 2. create SHARE_DETOKENIZER_COUNTER_FILE with default value 0
+    with open(SHARE_DETOKENIZER_COUNTER_FILE, "w") as f:
+        json.dump({"value": 0}, f)
+    print(f"create new counter file: {SHARE_DETOKENIZER_COUNTER_FILE}")
+    
+    if not os.path.exists(SHARE_DETOKENIZER_LOCK_FILE):
+        Path(SHARE_DETOKENIZER_LOCK_FILE).touch()
+    
+    
+
+def get_lock():
+    share_detokenizer_lock_file = open(SHARE_DETOKENIZER_LOCK_FILE, "w")
+    fcntl.flock(share_detokenizer_lock_file, fcntl.LOCK_EX) 
+    return share_detokenizer_lock_file
+
+def release_lock(share_detokenizer_lock_file):
+    fcntl.flock(share_detokenizer_lock_file, fcntl.LOCK_UN)
+    share_detokenizer_lock_file.close()
+
+def get_current_tokenzier_worker_id():
+    share_detokenizer_lock_file = get_lock()
+    try:
+        with open(SHARE_DETOKENIZER_COUNTER_FILE, "r") as f:
+            data = json.load(f)
+            current = data["value"]       
+        data["value"] = current + 1
+        with open(SHARE_DETOKENIZER_COUNTER_FILE, "w") as f:
+            json.dump(data, f)           
+    finally:
+        release_lock(share_detokenizer_lock_file)
+        return current
 
 async def print_exception_wrapper(func):
     """
@@ -545,6 +590,7 @@ def serialize_port_args(port_args: PortArgs) -> dict:
         "rpc_ipc_name": port_args.rpc_ipc_name,
         "metrics_ipc_name": port_args.metrics_ipc_name,
         "tokenizer_worker_ipc_name": port_args.tokenizer_worker_ipc_name,
+        "detokenizer_worker_ipc_name_list":port_args.detokenizer_worker_ipc_name_list,
     }
 
 

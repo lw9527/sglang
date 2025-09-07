@@ -105,6 +105,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
+from sglang.srt.managers.multi_tokenizer_mixin import get_worker_ids_from_req_rids
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -134,7 +135,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
-from sglang.srt.managers.utils import DPBalanceMeta, validate_input_length
+from sglang.srt.managers.utils import DPBalanceMeta, validate_input_length, is_health_check_generate_req
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.lora_radix_cache import LoRARadixCache
@@ -277,9 +278,11 @@ class Scheduler(
                 )
             else:
                 # Send to the DetokenizerManager
-                self.send_to_detokenizer = get_zmq_socket(
-                    context, zmq.PUSH, port_args.detokenizer_ipc_name, False
-                )
+                self.send_to_detokenizer = []
+                for i in range(self.server_args.detokenizer_worker_num):
+                    self.send_to_detokenizer.append(get_zmq_socket(
+                        context, zmq.PUSH, port_args.detokenizer_worker_ipc_name_list[i], False
+                    ))
 
             if self.server_args.sleep_on_idle:
                 self.idle_sleeper = IdleSleeper(
@@ -2395,7 +2398,10 @@ class Scheduler(
         return result
 
     def register_multi_tokenizer(self, recv_req: MultiTokenizerRegisterReq):
-        self.send_to_detokenizer.send_pyobj(recv_req)
+        worker_id = get_worker_ids_from_req_rids(recv_req.rids)[0]
+        detokenizer_index = worker_id % self.server_args.detokenizer_worker_num
+        # for i in range(self.server_args.detokenizer_worker_num):
+        self.send_to_detokenizer[detokenizer_index].send_pyobj(recv_req)
         return recv_req
 
     def slow_down(self, recv_req: SlowDownReqInput):
@@ -2492,8 +2498,7 @@ class IdleSleeper:
             torch.cuda.empty_cache()
 
 
-def is_health_check_generate_req(recv_req):
-    return getattr(recv_req, "rid", "").startswith("HEALTH_CHECK")
+
 
 
 def is_work_request(recv_req):
