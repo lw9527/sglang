@@ -295,7 +295,7 @@ class Scheduler(
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
-            self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+            self.send_to_detokenizer = [SimpleNamespace(send_pyobj=lambda x: None)]
 
         if self.current_scheduler_metrics_enabled():
             self.send_metrics_from_scheduler = get_zmq_socket(
