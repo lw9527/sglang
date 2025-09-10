@@ -2398,11 +2398,8 @@ class Scheduler(
         return result
 
     def register_multi_tokenizer(self, recv_req: MultiTokenizerRegisterReq):
-        #worker_id = get_worker_ids_from_req_rids(recv_req.rids)[0]
-        #detokenizer_index = worker_id % self.server_args.detokenizer_worker_num
-        for i in range(self.server_args.detokenizer_worker_num):
-            self.send_to_detokenizer[i].send_pyobj(recv_req)
-        #self.send_to_detokenizer[detokenizer_index].send_pyobj(recv_req)
+        for detokenizer in self.send_to_detokenizer:
+            detokenizer.send_pyobj(recv_req)
         return recv_req
 
     def slow_down(self, recv_req: SlowDownReqInput):

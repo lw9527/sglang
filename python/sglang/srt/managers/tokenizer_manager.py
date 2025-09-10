@@ -2181,6 +2181,9 @@ class _Communicator(Generic[T]):
         return result_values
 
     def handle_recv(self, recv_obj: T):
+        if self._result_values is None and isinstance(recv_obj, MultiTokenizerRegisterReq):
+            logger.warning("_result_values is None in handle_recv, ingore")
+            return 
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
             self._result_event.set()
