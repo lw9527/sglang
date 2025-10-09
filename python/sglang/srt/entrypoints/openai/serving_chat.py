@@ -150,6 +150,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
             customer_labels=customer_labels,
+            custom_logit_processor=request.custom_logit_processor,
         )
 
         return adapted_request, request
@@ -403,6 +404,7 @@ class OpenAIServingChat(OpenAIServingBase):
             "ignore_eos": request.ignore_eos,
             "skip_special_tokens": request.skip_special_tokens,
             "logit_bias": request.logit_bias,
+            "custom_params":request.custom_params,
         }
 
         if request.response_format and request.response_format.type == "json_schema":

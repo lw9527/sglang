@@ -541,6 +541,10 @@ class ChatCompletionRequest(BaseModel):
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
 
+    # Custom logit processor for advanced sampling control
+    custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
+    custom_params: Optional[Dict] = None
+    
     # For request id
     rid: Optional[Union[List[str], str]] = None
 
