@@ -1034,6 +1034,30 @@ class OpenAIServingChat(OpenAIServingBase):
                 return False
         return False
 
+    def _decode_unicode_escapes_in_json_string(self, json_str: str) -> str:
+        r"""Decode Unicode escape sequences in a JSON string to avoid double escaping.
+        
+        When model_dump_json() serializes a string containing \uXXXX sequences,
+        it will escape backslashes, turning \uXXXX into \\uXXXX. By decoding
+        Unicode escapes first, we ensure proper serialization.
+        """
+        if not isinstance(json_str, str) or "\\u" not in json_str:
+            return json_str
+        
+        import re
+        def decode_unicode_escape(match):
+            """Decode a single \\uXXXX sequence"""
+            hex_str = match.group(1)
+            try:
+                code_point = int(hex_str, 16)
+                return chr(code_point)
+            except (ValueError, OverflowError):
+                return match.group(0)  # Return original if decoding fails
+        
+        # Replace \\uXXXX sequences with actual Unicode characters
+        # This pattern matches \\u followed by exactly 4 hex digits
+        return re.sub(r'\\u([0-9a-fA-F]{4})', decode_unicode_escape, json_str)
+
     async def _process_tool_call_stream(
         self,
         index: int,
@@ -1108,12 +1132,18 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_id = None
                 function_name = None
 
+            # Decode Unicode escape sequences in parameters to avoid double escaping
+            # When model_dump_json() serializes the string, it will escape backslashes,
+            # turning \uXXXX into \\uXXXX. By decoding Unicode escapes first, we
+            # ensure proper serialization.
+            arguments_value = self._decode_unicode_escapes_in_json_string(call_item.parameters)
+            
             tool_call = ToolCall(
                 id=tool_call_id,
                 index=call_item.tool_index,
                 function=FunctionResponse(
                     name=function_name,
-                    arguments=call_item.parameters,
+                    arguments=arguments_value,
                 ),
             )
 
@@ -1186,6 +1216,9 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         if remaining_call:
+            # Decode Unicode escape sequences to avoid double escaping
+            remaining_call = self._decode_unicode_escapes_in_json_string(remaining_call)
+            
             # Create tool call chunk with remaining arguments
             tool_call = ToolCall(
                 id=None,  # No ID for argument deltas
