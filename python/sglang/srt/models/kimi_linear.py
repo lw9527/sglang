@@ -1,5 +1,6 @@
 # Adapted from: https://github.com/vllm-project/vllm/blob/0384aa7150c4c9778efca041ffd1beb3ad2bd694/vllm/model_executor/models/kimi_linear.py
 
+import logging
 from collections.abc import Iterable
 from typing import Optional
 
@@ -17,6 +18,11 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.layers.attention.fla.kda import fused_kda_gate
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    get_attn_tp_context,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -46,11 +52,15 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
+from sglang.srt.models.deepseek_common.utils import _device_sm, _is_cuda
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAttention
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
+
+logger = logging.getLogger(__name__)
 
 
 class KimiMoE(nn.Module):
@@ -71,6 +81,11 @@ class KimiMoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.num_shared_experts = config.num_shared_experts
+        self.num_fused_shared_experts = (
+            0
+            if get_global_server_args().disable_shared_experts_fusion
+            else config.num_shared_experts
+        )
         self.layer_idx = layer_idx
         self.alt_stream = alt_stream
 
@@ -92,8 +107,11 @@ class KimiMoE(nn.Module):
         self.gate.e_score_correction_bias = nn.Parameter(torch.empty(num_experts))
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.n_routed_experts,
-            top_k=config.num_experts_per_token,
+            num_experts=config.n_routed_experts
+            + self.num_fused_shared_experts
+            + get_global_server_args().ep_num_redundant_experts,
+            num_fused_shared_experts=self.num_fused_shared_experts,
+            top_k=config.num_experts_per_token + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=self.layer_idx,
@@ -103,10 +121,12 @@ class KimiMoE(nn.Module):
         )
 
         self.topk = TopK(
-            top_k=config.num_experts_per_token,
+            top_k=config.num_experts_per_token + self.num_fused_shared_experts,
+            layer_id=self.layer_idx,
             renormalize=moe_renormalize,
             use_grouped_topk=True,
             num_expert_group=config.num_expert_group,
+            num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             quant_config=quant_config,
@@ -117,7 +137,7 @@ class KimiMoE(nn.Module):
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
         )
 
-        if self.num_shared_experts is not None:
+        if self.num_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = moe_intermediate_size * self.num_shared_experts
             self.shared_experts = KimiMLP(
                 hidden_size=config.hidden_size,
@@ -127,7 +147,19 @@ class KimiMoE(nn.Module):
                 reduce_results=False,
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_shared_experts(self, hidden_states):
+        if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+            return self.shared_experts(hidden_states)
+        else:
+            return None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
 
@@ -135,6 +167,7 @@ class KimiMoE(nn.Module):
 
         if (
             self.alt_stream is not None
+            and self.num_fused_shared_experts == 0
             and self.num_shared_experts is not None
             and hidden_states.shape[0] > 0
             and get_is_capture_mode()
@@ -142,7 +175,7 @@ class KimiMoE(nn.Module):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
 
-            shared_output = self.shared_experts(hidden_states.clone())
+            shared_output = self._forward_shared_experts(hidden_states)
 
             with torch.cuda.stream(self.alt_stream):
                 router_logits, _ = self.gate(hidden_states)
@@ -151,16 +184,18 @@ class KimiMoE(nn.Module):
 
             current_stream.wait_stream(self.alt_stream)
         else:
-            if self.num_shared_experts is not None and hidden_states.shape[0] > 0:
-                shared_output = self.shared_experts(hidden_states)
-            router_logits, _ = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            if hidden_states.shape[0] > 0:
+                shared_output = self._forward_shared_experts(hidden_states)
+                router_logits, _ = self.gate(hidden_states)
+                topk_output = self.topk(hidden_states, router_logits)
+            else:
+                topk_output = self.topk.empty_topk_output(hidden_states.device)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not should_allreduce_fusion and not use_reduce_scatter:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
@@ -173,6 +208,7 @@ class KimiDeltaAttention(nn.Module):
         config: KimiLinearConfig,
         quant_config: Optional[QuantizationConfig] = None,
         rms_norm_eps: float = 1e-5,
+        reduce_results: bool = True,
         prefix: str = "",
         **kwargs,
     ) -> None:
@@ -310,6 +346,7 @@ class KimiDeltaAttention(nn.Module):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -417,7 +454,9 @@ class KimiDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.config = config
         self.alt_stream = alt_stream
+        self.layer_id = layer_idx
 
         self.is_moe = config.is_moe
 
@@ -427,6 +466,7 @@ class KimiDecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 config=config,
                 quant_config=quant_config,
+                reduce_results=False,
                 prefix=f"{prefix}.self_attn",
             )
         else:
@@ -435,6 +475,7 @@ class KimiDecoderLayer(nn.Module):
                 hidden_size=self.hidden_size,
                 num_heads=config.num_attention_heads,
                 quant_config=quant_config,
+                reduce_results=False,
                 prefix=f"{prefix}.self_attn",
                 config=config,
                 qk_nope_head_dim=config.qk_nope_head_dim,
@@ -445,12 +486,19 @@ class KimiDecoderLayer(nn.Module):
                 skip_rope=True,
             )
 
-        if (
-            self.is_moe
-            and config.num_experts is not None
-            and layer_idx >= config.first_k_dense_replace
-            and layer_idx % config.moe_layer_freq == 0
-        ):
+        self.is_layer_sparse = self._is_layer_sparse(layer_idx)
+        is_previous_layer_sparse = self._is_layer_sparse(layer_idx - 1)
+        is_next_layer_sparse = self._is_layer_sparse(layer_idx + 1)
+
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_idx,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=self.is_layer_sparse,
+            is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
+        )
+
+        if self.is_layer_sparse:
             self.block_sparse_moe = KimiMoE(
                 config=config,
                 quant_config=quant_config,
@@ -472,6 +520,31 @@ class KimiDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # Use prepare_qkv_latent for MLA layers to overlap QKV latent computation
+        # with allreduce from the previous layer. KDA layers don't have this.
+        qkv_latent_func = None
+        if not config.is_kda_layer(layer_idx) and hasattr(
+            self.self_attn, "prepare_qkv_latent"
+        ):
+            qkv_latent_func = self.self_attn.prepare_qkv_latent
+
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
+            is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
+            qkv_latent_func=qkv_latent_func,
+        )
+
+    def _is_layer_sparse(self, layer_id: int) -> bool:
+        return (
+            self.is_moe
+            and self.config.num_experts is not None
+            and layer_id >= self.config.first_k_dense_replace
+            and layer_id % self.config.moe_layer_freq == 0
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -480,13 +553,12 @@ class KimiDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        # LayerCommunicator handles allreduce + layernorm fusion
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
 
+        # Self Attention
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             positions=positions,
@@ -494,9 +566,45 @@ class KimiDecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
         )
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        # Allreduce + post-attention layernorm
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+
+        # Determine if we should fuse allreduce with next layer
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        # Fully Connected (MoE or Dense MLP)
+        if isinstance(self.mlp, KimiMoE):
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+            )
+        else:
+            # LlamaMLP uses use_reduce_scatter to skip allreduce
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                use_reduce_scatter=should_allreduce_fusion or use_reduce_scatter,
+            )
+
+        if should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+
+        if not should_allreduce_fusion:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
+
         return hidden_states, residual
 
 
@@ -620,6 +728,8 @@ class KimiLinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        self.num_fused_shared_experts = 0
+        self.determine_num_fused_shared_experts()
         self.model = KimiLinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -636,6 +746,29 @@ class KimiLinearForCausalLM(nn.Module):
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
 
+    def determine_num_fused_shared_experts(self):
+        if get_global_server_args().disable_shared_experts_fusion:
+            return
+
+        disable_reason = None
+        if not getattr(self.config, "n_shared_experts", None):
+            disable_reason = "No shared experts are defined in the config."
+        elif not _is_cuda:
+            disable_reason = "Shared experts fusion currently requires CUDA devices."
+        elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
+            disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
+
+        if disable_reason is not None:
+            get_global_server_args().disable_shared_experts_fusion = True
+            self.num_fused_shared_experts = 0
+            logger.info(
+                f"{disable_reason} Shared experts fusion optimization is disabled."
+            )
+            return
+
+        self.num_fused_shared_experts = self.config.n_shared_experts
+        logger.info("Shared experts fusion optimization enabled.")
+
     @torch.no_grad()
     def forward(
         self,
@@ -645,13 +778,14 @@ class KimiLinearForCausalLM(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            inputs_embeds,
-            pp_proxy_tensors,
-        )
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                inputs_embeds,
+                pp_proxy_tensors,
+            )
         if self.pp_group.is_last_rank:
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch
@@ -689,15 +823,36 @@ class KimiLinearForCausalLM(nn.Module):
                 ckpt_gate_proj_name="w1",
                 ckpt_down_proj_name="w2",
                 ckpt_up_proj_name="w3",
-                num_experts=self.config.num_experts,
+                num_experts=self.config.num_experts + self.num_fused_shared_experts,
             )
         else:
             expert_params_mapping = []
+
+        # Shared experts name mapping for fused shared experts:
+        # checkpoint: mlp.shared_experts.gate_proj → mlp.experts.{n_routed}.w1
+        # checkpoint: mlp.shared_experts.up_proj   → mlp.experts.{n_routed}.w3
+        # checkpoint: mlp.shared_experts.down_proj → mlp.experts.{n_routed}.w2
+        shared_expert_name_map = {
+            "gate_proj": "w1",
+            "up_proj": "w3",
+            "down_proj": "w2",
+        }
+
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for args in weights:
             name, loaded_weight = args[:2]
             kwargs = args[2] if len(args) > 2 else {}
+
+            # Remap shared expert weights to fused expert slot
+            if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+                for ckpt_name, expert_name in shared_expert_name_map.items():
+                    if f".{ckpt_name}." in name:
+                        name = name.replace(
+                            f"mlp.shared_experts.{ckpt_name}",
+                            f"mlp.experts.{self.config.num_experts}.{expert_name}",
+                        )
+                        break
             if "rotary_emb.inv_freq" in name:
                 continue
 

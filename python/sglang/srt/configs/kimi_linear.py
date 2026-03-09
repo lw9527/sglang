@@ -81,8 +81,9 @@ class KimiLinearConfig(PretrainedConfig):
         # moe config
         self.n_routed_experts = self.num_experts = num_experts
         self.num_experts_per_token = num_experts_per_token
+        self.num_experts_per_tok = num_experts_per_token
         self.moe_renormalize = moe_renormalize
-        self.num_shared_experts = num_shared_experts
+        self.n_shared_experts = self.num_shared_experts = num_shared_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.moe_router_activation_func = moe_router_activation_func
         assert self.moe_router_activation_func in ("softmax", "sigmoid")
