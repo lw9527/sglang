@@ -39,7 +39,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -133,17 +132,20 @@ class KimiMoE(nn.Module):
 
         shared_output = None
 
+        # Enable stream overlap for both prefill and decode when conditions are met
+        # This allows shared_experts and routed_experts to run in parallel
         if (
             self.alt_stream is not None
             and self.num_shared_experts is not None
             and hidden_states.shape[0] > 0
-            and get_is_capture_mode()
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
 
+            # Run shared experts on current stream (use clone to avoid race condition)
             shared_output = self.shared_experts(hidden_states.clone())
 
+            # Run gate + topk + routed experts on alt stream in parallel
             with torch.cuda.stream(self.alt_stream):
                 router_logits, _ = self.gate(hidden_states)
                 topk_output = self.topk(hidden_states, router_logits)
