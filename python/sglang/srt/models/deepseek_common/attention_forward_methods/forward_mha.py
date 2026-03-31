@@ -273,9 +273,13 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-        attn_output = zero_attn_tp_scatter_padding(
-            attn_output, forward_batch.extend_num_tokens
-        )
+        # When `--enable-attn-tp-input-scattered` is enabled, attention backends may leave
+        # garbage values in padded rows. During generation, `extend_num_tokens` can be None,
+        # which would skip zeroing and may lead to repeated/degenerated outputs.
+        extend_num_tokens = forward_batch.extend_num_tokens
+        if extend_num_tokens is None and get_attn_tp_context().input_scattered:
+            extend_num_tokens = forward_batch.seq_lens_sum
+        attn_output = zero_attn_tp_scatter_padding(attn_output, extend_num_tokens)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
@@ -330,9 +334,13 @@ class DeepseekMHAForwardMixin:
                 forward_batch=forward_batch,
             )
 
-        attn_output = zero_attn_tp_scatter_padding(
-            attn_output, forward_batch.extend_num_tokens
-        )
+        # When `--enable-attn-tp-input-scattered` is enabled, attention backends may leave
+        # garbage values in padded rows. During generation, `extend_num_tokens` can be None,
+        # which would skip zeroing and may lead to repeated/degenerated outputs.
+        extend_num_tokens = forward_batch.extend_num_tokens
+        if extend_num_tokens is None and get_attn_tp_context().input_scattered:
+            extend_num_tokens = forward_batch.seq_lens_sum
+        attn_output = zero_attn_tp_scatter_padding(attn_output, extend_num_tokens)
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
