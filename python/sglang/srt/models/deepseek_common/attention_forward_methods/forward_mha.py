@@ -278,7 +278,9 @@ class DeepseekMHAForwardMixin:
         # which would skip zeroing and may lead to repeated/degenerated outputs.
         extend_num_tokens = forward_batch.extend_num_tokens
         if extend_num_tokens is None and get_attn_tp_context().input_scattered:
-            extend_num_tokens = forward_batch.seq_lens_sum
+            extend_num_tokens = forward_batch.num_token_non_padded_cpu
+            if extend_num_tokens is None:
+                extend_num_tokens = forward_batch.seq_lens_sum
         attn_output = zero_attn_tp_scatter_padding(attn_output, extend_num_tokens)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
@@ -339,7 +341,9 @@ class DeepseekMHAForwardMixin:
         # which would skip zeroing and may lead to repeated/degenerated outputs.
         extend_num_tokens = forward_batch.extend_num_tokens
         if extend_num_tokens is None and get_attn_tp_context().input_scattered:
-            extend_num_tokens = forward_batch.seq_lens_sum
+            extend_num_tokens = forward_batch.num_token_non_padded_cpu
+            if extend_num_tokens is None:
+                extend_num_tokens = forward_batch.seq_lens_sum
         attn_output = zero_attn_tp_scatter_padding(attn_output, extend_num_tokens)
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)

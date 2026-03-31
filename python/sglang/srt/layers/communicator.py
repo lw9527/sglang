@@ -177,6 +177,16 @@ class AttentionInputs:
             self.qkv_latent_ = self.tp_all_gather_hidden_states(
                 self.qkv_latent_, self.forward_batch
             )
+            # Padded tail tokens may correspond to a real token id (e.g. `0`) and can
+            # therefore produce non-zero hidden states/qkv latent. Zeroing here ensures
+            # attention kernels never see garbage from padded rows (even if masking is imperfect).
+            valid = getattr(self.forward_batch, "num_token_non_padded_cpu", None)
+            if (
+                isinstance(valid, int)
+                and valid >= 0
+                and valid < self.qkv_latent_.shape[0]
+            ):
+                self.qkv_latent_[valid:] = 0
         return self.qkv_latent_
 
     def fetch_hidden_states(self):
@@ -187,6 +197,14 @@ class AttentionInputs:
             self.hidden_states_ = self.tp_all_gather_hidden_states(
                 self.hidden_states_, self.forward_batch
             )
+            # See `fetch_qkv_latent()` for the motivation.
+            valid = getattr(self.forward_batch, "num_token_non_padded_cpu", None)
+            if (
+                isinstance(valid, int)
+                and valid >= 0
+                and valid < self.hidden_states_.shape[0]
+            ):
+                self.hidden_states_[valid:] = 0
         return self.hidden_states_
 
 
