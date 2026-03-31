@@ -177,16 +177,16 @@ class AttentionInputs:
             self.qkv_latent_ = self.tp_all_gather_hidden_states(
                 self.qkv_latent_, self.forward_batch
             )
-            # Padded tail tokens may correspond to a real token id (e.g. `0`) and can
-            # therefore produce non-zero hidden states/qkv latent. Zeroing here ensures
-            # attention kernels never see garbage from padded rows (even if masking is imperfect).
-            valid = getattr(self.forward_batch, "num_token_non_padded_cpu", None)
+            # Use out_cache_loc==0 to identify padded rows precisely. Under
+            # input_scattered, padded rows may not always form a contiguous tail.
+            out_cache_loc = getattr(self.forward_batch, "out_cache_loc", None)
             if (
-                isinstance(valid, int)
-                and valid >= 0
-                and valid < self.qkv_latent_.shape[0]
+                out_cache_loc is not None
+                and out_cache_loc.shape[0] == self.qkv_latent_.shape[0]
             ):
-                self.qkv_latent_[valid:] = 0
+                self.qkv_latent_ = self.qkv_latent_.masked_fill(
+                    (out_cache_loc == 0).view(-1, 1), 0
+                )
         return self.qkv_latent_
 
     def fetch_hidden_states(self):
@@ -198,13 +198,14 @@ class AttentionInputs:
                 self.hidden_states_, self.forward_batch
             )
             # See `fetch_qkv_latent()` for the motivation.
-            valid = getattr(self.forward_batch, "num_token_non_padded_cpu", None)
+            out_cache_loc = getattr(self.forward_batch, "out_cache_loc", None)
             if (
-                isinstance(valid, int)
-                and valid >= 0
-                and valid < self.hidden_states_.shape[0]
+                out_cache_loc is not None
+                and out_cache_loc.shape[0] == self.hidden_states_.shape[0]
             ):
-                self.hidden_states_[valid:] = 0
+                self.hidden_states_ = self.hidden_states_.masked_fill(
+                    (out_cache_loc == 0).view(-1, 1), 0
+                )
         return self.hidden_states_
 
 

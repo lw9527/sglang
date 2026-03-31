@@ -282,6 +282,15 @@ class DeepseekMHAForwardMixin:
             if extend_num_tokens is None:
                 extend_num_tokens = forward_batch.seq_lens_sum
         attn_output = zero_attn_tp_scatter_padding(attn_output, extend_num_tokens)
+        if get_attn_tp_context().input_scattered:
+            out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+            if (
+                out_cache_loc is not None
+                and out_cache_loc.shape[0] == attn_output.shape[0]
+            ):
+                attn_output = attn_output.masked_fill(
+                    (out_cache_loc == 0).view(-1, 1), 0
+                )
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
@@ -345,6 +354,15 @@ class DeepseekMHAForwardMixin:
             if extend_num_tokens is None:
                 extend_num_tokens = forward_batch.seq_lens_sum
         attn_output = zero_attn_tp_scatter_padding(attn_output, extend_num_tokens)
+        if get_attn_tp_context().input_scattered:
+            out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+            if (
+                out_cache_loc is not None
+                and out_cache_loc.shape[0] == attn_output.shape[0]
+            ):
+                attn_output = attn_output.masked_fill(
+                    (out_cache_loc == 0).view(-1, 1), 0
+                )
 
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
