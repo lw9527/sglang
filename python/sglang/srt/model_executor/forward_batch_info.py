@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -76,6 +77,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
+logger = logging.getLogger(__name__)
 
 
 class ForwardMode(IntEnum):
@@ -1049,11 +1051,52 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
         elif self.forward_mode.is_extend():
             num_tokens = self.seq_lens_sum
-            logits_output.next_token_logits = logits_output.next_token_logits[
-                :num_tokens
-            ]
-            if logits_output.hidden_states is not None:
-                logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+            # Under input_scattered mode, padded rows may not always be a contiguous
+            # tail. Prefer out_cache_loc!=0 to select valid rows for sampling/logprobs.
+            out_cache_loc = getattr(self, "out_cache_loc", None)
+            if (
+                out_cache_loc is not None
+                and out_cache_loc.shape[0] == logits_output.next_token_logits.shape[0]
+            ):
+                valid_mask = out_cache_loc != 0
+                if torch.any(valid_mask):
+                    if logger.isEnabledFor(logging.DEBUG):
+                        before = int(logits_output.next_token_logits.shape[0])
+                        valid = int(valid_mask.sum().item())
+                        logger.debug(
+                            "extend logits filter by out_cache_loc: before=%d valid=%d seq_lens_sum=%d",
+                            before,
+                            valid,
+                            int(num_tokens),
+                        )
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        valid_mask
+                    ][:num_tokens]
+                    if logits_output.hidden_states is not None:
+                        logits_output.hidden_states = logits_output.hidden_states[
+                            valid_mask
+                        ][:num_tokens]
+                else:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "extend logits filter by out_cache_loc found no valid rows; fallback slice seq_lens_sum=%d",
+                            int(num_tokens),
+                        )
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :num_tokens
+                    ]
+                    if logits_output.hidden_states is not None:
+                        logits_output.hidden_states = logits_output.hidden_states[
+                            :num_tokens
+                        ]
+            else:
+                logits_output.next_token_logits = logits_output.next_token_logits[
+                    :num_tokens
+                ]
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states[
+                        :num_tokens
+                    ]
 
     @property
     def can_run_tbo(self):

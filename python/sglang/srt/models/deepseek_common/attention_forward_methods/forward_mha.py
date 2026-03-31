@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -35,6 +36,8 @@ if _use_aiter_gfx95:
 
     from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
+
+logger = logging.getLogger(__name__)
 
 # Configs for DeepSeek-V3:
 # num_local_heads = 128
@@ -288,6 +291,13 @@ class DeepseekMHAForwardMixin:
                 out_cache_loc is not None
                 and out_cache_loc.shape[0] == attn_output.shape[0]
             ):
+                if logger.isEnabledFor(logging.DEBUG):
+                    padded = int((out_cache_loc == 0).sum().item())
+                    logger.debug(
+                        "input_scattered[MHA] mask padded rows: padded=%d total=%d",
+                        padded,
+                        int(out_cache_loc.shape[0]),
+                    )
                 attn_output = attn_output.masked_fill(
                     (out_cache_loc == 0).view(-1, 1), 0
                 )
@@ -360,6 +370,13 @@ class DeepseekMHAForwardMixin:
                 out_cache_loc is not None
                 and out_cache_loc.shape[0] == attn_output.shape[0]
             ):
+                if logger.isEnabledFor(logging.DEBUG):
+                    padded = int((out_cache_loc == 0).sum().item())
+                    logger.debug(
+                        "input_scattered[MHA_CHUNK] mask padded rows: padded=%d total=%d",
+                        padded,
+                        int(out_cache_loc.shape[0]),
+                    )
                 attn_output = attn_output.masked_fill(
                     (out_cache_loc == 0).view(-1, 1), 0
                 )

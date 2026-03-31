@@ -71,6 +71,8 @@ from sglang.srt.utils import (
     is_sm100_supported,
 )
 
+logger = logging.getLogger(__name__)
+
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = _is_cuda and is_sm90_supported()
@@ -184,6 +186,13 @@ class AttentionInputs:
                 out_cache_loc is not None
                 and out_cache_loc.shape[0] == self.qkv_latent_.shape[0]
             ):
+                if logger.isEnabledFor(logging.DEBUG):
+                    padded = int((out_cache_loc == 0).sum().item())
+                    logger.debug(
+                        "input_scattered[qkv_latent] zero padded rows: padded=%d total=%d",
+                        padded,
+                        int(out_cache_loc.shape[0]),
+                    )
                 self.qkv_latent_ = self.qkv_latent_.masked_fill(
                     (out_cache_loc == 0).view(-1, 1), 0
                 )
@@ -203,6 +212,13 @@ class AttentionInputs:
                 out_cache_loc is not None
                 and out_cache_loc.shape[0] == self.hidden_states_.shape[0]
             ):
+                if logger.isEnabledFor(logging.DEBUG):
+                    padded = int((out_cache_loc == 0).sum().item())
+                    logger.debug(
+                        "input_scattered[hidden_states] zero padded rows: padded=%d total=%d",
+                        padded,
+                        int(out_cache_loc.shape[0]),
+                    )
                 self.hidden_states_ = self.hidden_states_.masked_fill(
                     (out_cache_loc == 0).view(-1, 1), 0
                 )
