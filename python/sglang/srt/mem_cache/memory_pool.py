@@ -1553,6 +1553,14 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
         assert not self.nsa_kv_cache_store_fp8
+        if loc.numel() > 0:
+            pad_mask = loc == 0
+            if torch.any(pad_mask):
+                # Slot 0 is reserved as a dummy location for padded tokens.
+                # Keep its content strictly zero to avoid accidental leakage when
+                # backends read padded block-table entries.
+                cache_k = cache_k.clone()
+                cache_k[pad_mask] = 0
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -1571,6 +1579,16 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
     ):
         layer_id = layer.layer_id
+        if loc.numel() > 0:
+            pad_mask = loc == 0
+            if torch.any(pad_mask):
+                # Slot 0 is reserved as a dummy location for padded tokens.
+                # Keep its content strictly zero to avoid accidental leakage when
+                # backends read padded block-table entries.
+                cache_k_nope = cache_k_nope.clone()
+                cache_k_rope = cache_k_rope.clone()
+                cache_k_nope[pad_mask] = 0
+                cache_k_rope[pad_mask] = 0
 
         if self.nsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
