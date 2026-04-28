@@ -1748,6 +1748,14 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
+    def _session_id_for(self, bootstrap_info: dict) -> str:
+        """Hook for backends that maintain a per-Prefill engine pool (e.g.
+        Ascend's per-P MemFabric store). Default returns the receiver's single
+        ``self.session_id`` which preserves Mooncake/NIXL/Mori behavior.
+        Ascend's receiver overrides this to return the session_id of whichever
+        engine is bound to the target Prefill's store_url."""
+        return self.session_id
+
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:
             packed_kv_data_ptrs = b"".join(
@@ -1790,13 +1798,14 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 staging_total_size_str = b""
 
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            session_id = self._session_id_for(bootstrap_info)
             with lock:
                 sock.send_multipart(
                     [
                         "None".encode("ascii"),
                         self.kv_mgr.local_ip.encode("ascii"),
                         str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
+                        session_id.encode("ascii"),
                         packed_kv_data_ptrs,
                         packed_aux_data_ptrs,
                         packed_state_data_ptrs,
@@ -1843,6 +1852,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
+            session_id = self._session_id_for(bootstrap_info)
 
             with lock:
                 sock.send_multipart(
@@ -1850,7 +1860,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         str(self.bootstrap_room).encode("ascii"),
                         self.kv_mgr.local_ip.encode("ascii"),
                         str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
+                        session_id.encode("ascii"),
                         kv_indices.tobytes() if not is_dummy else b"",
                         str(aux_index).encode("ascii") if not is_dummy else b"",
                         (

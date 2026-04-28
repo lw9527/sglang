@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -28,7 +28,21 @@ class AscendTransferEngine(MooncakeTransferEngine):
         hostname: str,
         npu_id: int,
         disaggregation_mode: DisaggregationMode,
+        store_url: Optional[str] = None,
     ):
+        """Create one Ascend MemFabric TransferEngine bound to a single store.
+
+        Args:
+            hostname: Local hostname/IP used to compose the engine ``unique_id``.
+            npu_id: NPU device id passed straight to MemFabric.
+            disaggregation_mode: PREFILL or DECODE; determines the ``role``.
+            store_url: MemFabric config store URL this engine should register
+                with. If ``None`` we fall back to the legacy ``ASCEND_MF_STORE_URL``
+                environment variable purely for backward-compatibility with old
+                deployment scripts; new code paths should always pass an
+                explicit per-Prefill store_url to avoid the SPOF where every
+                P/D depended on the first P's address.
+        """
         if import_error is not None:
             logger.warning(
                 "Please install memfabric_hybrid, for details, see docs/backend/pd_disaggregation.md"
@@ -39,8 +53,22 @@ class AscendTransferEngine(MooncakeTransferEngine):
         self.hostname = hostname
         self.npu_id = npu_id
 
-        # Centralized storage address of the AscendTransferEngine
-        self.store_url = os.getenv("ASCEND_MF_STORE_URL")
+        if store_url is None:
+            store_url = os.getenv("ASCEND_MF_STORE_URL")
+            if store_url:
+                logger.warning(
+                    "AscendTransferEngine falling back to ASCEND_MF_STORE_URL=%s. "
+                    "This still pins all peers to a single global store and is "
+                    "kept only for legacy compatibility.",
+                    store_url,
+                )
+        if not store_url:
+            raise ValueError(
+                "AscendTransferEngine requires a store_url. Either pass it "
+                "explicitly (preferred, per-Prefill self-host) or set "
+                "ASCEND_MF_STORE_URL for legacy deployments."
+            )
+        self.store_url = store_url
         if disaggregation_mode == DisaggregationMode.PREFILL:
             self.role = "Prefill"
         elif disaggregation_mode == DisaggregationMode.DECODE:
@@ -52,6 +80,17 @@ class AscendTransferEngine(MooncakeTransferEngine):
             self.hostname, self.engine.get_rpc_port()
         ).to_host_port_str()
         self.initialize()
+
+    @property
+    def unique_id(self) -> str:
+        """Alias for the MemFabric engine ``unique_id`` (== session_id, ip:port)."""
+        return self.session_id
+
+    @staticmethod
+    def derive_local_store_url(local_ip: str, port: int) -> str:
+        """Compose the ``tcp://<local_ip>:<port>`` URL each Prefill instance
+        should use to self-host its own MemFabric config store."""
+        return f"tcp://{local_ip}:{int(port)}"
 
     def initialize(self) -> None:
         from sglang.srt.distributed.parallel_state import (
@@ -78,7 +117,9 @@ class AscendTransferEngine(MooncakeTransferEngine):
             self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
         )
         if ret_value != 0:
-            logger.error("Ascend Transfer Engine initialization failed.")
+            logger.error(
+                f"Ascend Transfer Engine initialization failed for store_url={self.store_url}."
+            )
             raise RuntimeError("Ascend Transfer Engine initialization failed.")
 
     def batch_register(self, ptrs: List[int], lengths: List[int]):

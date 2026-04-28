@@ -79,10 +79,20 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    # Optional backend-specific fields. Currently used by the Ascend backend so
+    # that each Prefill instance can self-host its MemFabric config store and
+    # tell the Decode side which store_url + engine unique_id to talk to,
+    # avoiding the SPOF where every P/D depends on the first P's IP.
+    store_url: Optional[str] = None
+    engine_unique_id: Optional[str] = None
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
         self.rank_port = int(self.rank_port)
+        if self.store_url is not None:
+            self.store_url = str(self.store_url)
+        if self.engine_unique_id is not None:
+            self.engine_unique_id = str(self.engine_unique_id)
 
 
 class CommonKVManager(BaseKVManager):
@@ -325,6 +335,13 @@ class CommonKVManager(BaseKVManager):
         info.required_dst_info_num = required_dst_info_num
         info.required_prefill_response_num = required_prefill_response_num
 
+    def _get_extra_bootstrap_payload(self) -> Dict[str, Optional[str]]:
+        """Hook for backend-specific extra fields to register on the bootstrap
+        server. Subclasses (e.g. AscendKVManager) can override this to inject
+        ``store_url`` / ``engine_unique_id`` so each Prefill exposes its own
+        MemFabric store address. Default is an empty dict (no extras)."""
+        return {}
+
     def register_to_bootstrap(self):
         """Register prefill server info to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
@@ -353,6 +370,7 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
         }
+        payload.update(self._get_extra_bootstrap_payload())
 
         try:
             response = requests.put(url, json=payload, timeout=5)
@@ -787,6 +805,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        # Backend-specific optional fields (None for mooncake/nixl/mori).
+        # Ascend backend uses these to broadcast each Prefill instance's own
+        # MemFabric store_url so the Decode side does not have to hard-code a
+        # single global ASCEND_MF_STORE_URL.
+        store_url = data.get("store_url")
+        engine_unique_id = data.get("engine_unique_id")
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -826,6 +850,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                store_url=store_url,
+                engine_unique_id=engine_unique_id,
             )
 
             self._registered_count += 1

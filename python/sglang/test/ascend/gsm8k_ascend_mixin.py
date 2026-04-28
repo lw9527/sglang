@@ -29,7 +29,10 @@ class GSM8KAscendMixin(ABC):
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         os.environ["PYTORCH_NPU_ALLOC_CONF"] = "expandable_segments:True"
-        os.environ["ASCEND_MF_STORE_URL"] = "tcp://127.0.0.1:24666"
+        # Note: ASCEND_MF_STORE_URL is no longer required. The Ascend PD
+        # disaggregation backend now self-hosts a per-Prefill MemFabric config
+        # store, eliminating the SPOF where every P/D shared one address.
+        os.environ.pop("ASCEND_MF_STORE_URL", None)
         os.environ["HCCL_BUFFSIZE"] = "200"
         os.environ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "24"
         os.environ["USE_VLLM_CUSTOM_ALLREDUCE"] = "1"

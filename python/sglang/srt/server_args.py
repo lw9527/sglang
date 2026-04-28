@@ -6159,7 +6159,11 @@ class ServerArgs:
             "--disaggregation-bootstrap-port",
             type=int,
             default=ServerArgs.disaggregation_bootstrap_port,
-            help="Bootstrap server port on the prefill server. Default is 8998.",
+            help="Bootstrap server port on the prefill server. Default is 8998. "
+            "When the Ascend backend is enabled and ASCEND_MF_STORE_URL is "
+            "unset, each Prefill also self-hosts its MemFabric config store "
+            "at tcp://<local_ip>:<this_port + 1> automatically (no separate "
+            "flag needed) so killing one Prefill does not affect the others.",
         )
         parser.add_argument(
             "--disaggregation-ib-device",

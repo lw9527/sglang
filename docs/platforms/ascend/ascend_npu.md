@@ -188,10 +188,12 @@ python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --
 # Enabling CPU Affinity
 export SGLANG_SET_CPU_AFFINITY=1
 
-# PIP: recommended to config first Prefill Server IP
-# PORT: one free port
-# all sglang servers need to be config the same PIP and PORT,
-export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
+# Each Prefill instance now self-hosts its own MemFabric config store at
+# tcp://<local_ip>:<--disaggregation-bootstrap-port + 1> automatically (no
+# separate flag needed) and advertises it via the SGLang HTTP bootstrap, so
+# killing one Prefill no longer breaks the rest of the fleet. Setting
+# ASCEND_MF_STORE_URL is therefore *optional* and only needed for legacy
+# "single shared store" deployments.
 # if you are Atlas 800I A2 hardware and use rdma for kv cache transfer, add this parameter
 export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
 python3 -m sglang.launch_server \
@@ -209,10 +211,8 @@ python3 -m sglang.launch_server \
 
 2. Launch Decode Server
 ```shell
-# PIP: recommended to config first Prefill Server IP
-# PORT: one free port
-# all sglang servers need to be config the same PIP and PORT,
-export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
+# No ASCEND_MF_STORE_URL is required on the Decode side; it learns each
+# Prefill's MemFabric store_url through the SGLang HTTP bootstrap response.
 # if you are Atlas 800I A2 hardware and use rdma for kv cache transfer, add this parameter
 export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
 python3 -m sglang.launch_server \

@@ -1,5 +1,14 @@
 ## Qwen3 examples
 
+> **Note on `ASCEND_MF_STORE_URL`**: the PD scripts below still set this env
+> var to a fixed Prefill IP/port for historical (single-shared-store)
+> compatibility. It is **no longer required** -- each Prefill instance now
+> self-hosts its own MemFabric config store at
+> `tcp://<local_ip>:<--disaggregation-bootstrap-port + 1>` automatically (no
+> separate flag needed) and advertises the address via the
+> SGLang HTTP bootstrap, removing the SPOF where killing one Prefill took
+> down the entire fleet. Omit the export to opt into the new mode.
+
 ### Running Qwen3
 
 #### Running Qwen3-32B on 1 x Atlas 800I A3.
