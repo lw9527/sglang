@@ -468,7 +468,8 @@ class MMEncoder:
                 return load_audio(data, audio_sample_rate)
 
         except Exception as e:
-            raise RuntimeError(f"Error while loading data {data}: {e}")
+            data_len = len(data) if hasattr(data, "__len__") else "N/A"
+            raise RuntimeError(f"Error while loading data (len={data_len}): {e}")
 
     def submit_data_loading_tasks(self, items, modalities):
         futures = []

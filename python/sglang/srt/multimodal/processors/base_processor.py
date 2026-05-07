@@ -542,7 +542,8 @@ class BaseMultimodalProcessor(ABC):
                 return load_audio(data, audio_sample_rate)
 
         except Exception as e:
-            raise RuntimeError(f"Error while loading data {data}: {e}")
+            data_len = len(data) if hasattr(data, "__len__") else "N/A"
+            raise RuntimeError(f"Error while loading data (len={data_len}): {e}")
 
     def _submit_mm_data_loading_tasks_simple(
         self,
