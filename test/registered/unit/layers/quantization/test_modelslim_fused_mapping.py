@@ -41,6 +41,44 @@ class TestModelSlimFusedMapping(CustomTestCase):
             "language_model.model.layers.0.self_attn.q_a_proj",
         )
 
+    def test_nested_packed_modules_mapping_resolves_gate_up_proj(self):
+        quant_description = {
+            "language_model.model.layers.0.mlp.gate_proj.weight": "W8A8",
+            "language_model.model.layers.0.mlp.up_proj.weight": "W8A8",
+        }
+        config = ModelSlimConfig(
+            {
+                **quant_description,
+                "packed_modules_mapping": {
+                    "model": {
+                        "gate_up_proj": ["gate_proj", "up_proj"],
+                        "fused_qkv_a_proj_with_mqa": [
+                            "q_a_proj",
+                            "kv_a_proj_with_mqa",
+                        ],
+                    },
+                    "fused_qkv_a_proj_with_mqa": [
+                        "q_a_proj",
+                        "kv_a_proj_with_mqa",
+                    ],
+                },
+            }
+        )
+
+        prefix = "language_model.model.layers.0.mlp.gate_up_proj"
+        proj_name = prefix.split(".")[-1]
+        fused_mapping = config._resolve_fused_modules_mapping(proj_name, "model")
+        prefix_in_quant_config = prefix.replace(
+            proj_name, fused_mapping["gate_up_proj"][0]
+        )
+        scheme = config.get_linear_scheme(layer=None, prefix=prefix_in_quant_config)
+
+        self.assertIsNotNone(scheme)
+        self.assertEqual(
+            prefix_in_quant_config,
+            "language_model.model.layers.0.mlp.gate_proj",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
