@@ -132,6 +132,19 @@ class ModelSlimConfig(QuantizationConfig):
     def from_config(cls, config: Dict[str, Any]) -> ModelSlimConfig:
         return cls(config)
 
+    def _resolve_fused_modules_mapping(
+        self, proj_name: str, key: str
+    ) -> Mapping[str, List[str]]:
+        subset = self.packed_modules_mapping.get(key, {})
+        if proj_name in subset:
+            return subset
+        # Models like DeepseekV3 publish a flat packed_modules_mapping instead of
+        # nesting entries under the "model" key used by loader.py.
+        shard_names = self.packed_modules_mapping.get(proj_name)
+        if isinstance(shard_names, list):
+            return self.packed_modules_mapping
+        return subset
+
     def get_quant_method(
         self,
         layer: torch.nn.Module,
@@ -153,12 +166,13 @@ class ModelSlimConfig(QuantizationConfig):
             packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
-            if proj_name in packed_modules_mapping_subset:
+            fused_modules_mapping = self._resolve_fused_modules_mapping(proj_name, key)
+            if proj_name in fused_modules_mapping:
                 prefix_in_quant_config = prefix.replace(
-                    proj_name, packed_modules_mapping_subset[proj_name][0]
+                    proj_name, fused_modules_mapping[proj_name][0]
                 )
             if self.is_layer_skipped(
-                prefix, packed_modules_mapping_subset
+                prefix, fused_modules_mapping
             ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
