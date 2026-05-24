@@ -77,24 +77,24 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # [size, head_num, head_dim] for each layer
-            # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            # Continuous memory improves the efficiency of Ascend`s transmission backend,
-            # while other backends remain unchanged.
-            self.kv_buffer = torch.zeros(
-                (
-                    2,
-                    self.layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    self.head_num,
-                    self.head_dim,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
+            # Per-layer K/V buffers (slot 0 reserved for padded tokens).
+            # 2 MiB alignment is provided process-wide by torch_npu (see
+            # init_npu_backend() in hardware_backend/npu/utils.py), so
+            # plain torch.zeros already satisfies CANN HCCL IPC RMA.
+            segment_shape = (
+                self.size // self.page_size + 1,
+                self.page_size,
+                self.head_num,
+                self.head_dim,
             )
-            self.k_buffer = self.kv_buffer[0]
-            self.v_buffer = self.kv_buffer[1]
+            self.k_buffer = [
+                torch.zeros(segment_shape, dtype=self.store_dtype, device=self.device)
+                for _ in range(self.layer_num)
+            ]
+            self.v_buffer = [
+                torch.zeros(segment_shape, dtype=self.store_dtype, device=self.device)
+                for _ in range(self.layer_num)
+            ]
 
             if self.use_fia:
                 self.k_buffer = []
@@ -292,42 +292,38 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.custom_mem_pool = None
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = torch.zeros(
-                (
-                    layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    1,
-                    self.kv_lora_rank,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self.v_buffer = torch.zeros(
-                (
-                    layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    1,
-                    self.qk_rope_head_dim,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self.index_k_buffer = None
-            if self.index_head_dim is not None:
-                self.index_k_buffer = torch.zeros(
-                    (
-                        layer_num,
-                        self.size // self.page_size + 1,
-                        self.page_size,
-                        1,
-                        self.index_head_dim,
-                    ),
+            # Per-layer K/V buffers (slot 0 reserved for padded tokens).
+            # 2 MiB alignment is provided process-wide by torch_npu (see
+            # init_npu_backend() in hardware_backend/npu/utils.py), so
+            # plain torch.zeros already satisfies CANN HCCL IPC RMA.
+            num_pages = self.size // self.page_size + 1
+
+            self.k_buffer = [
+                torch.zeros(
+                    (num_pages, self.page_size, 1, self.kv_lora_rank),
                     dtype=self.store_dtype,
                     device=self.device,
                 )
+                for _ in range(layer_num)
+            ]
+            self.v_buffer = [
+                torch.zeros(
+                    (num_pages, self.page_size, 1, self.qk_rope_head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(layer_num)
+            ]
+            self.index_k_buffer = None
+            if self.index_head_dim is not None:
+                self.index_k_buffer = [
+                    torch.zeros(
+                        (num_pages, self.page_size, 1, self.index_head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(layer_num)
+                ]
 
         self._finalize_allocation_log(size)
 
