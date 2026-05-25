@@ -742,6 +742,13 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         return hidden_states
 
+    def _map_language_model_weight_name(self, name: str) -> str:
+        # ModelSlim/Quark use prefix="language_model" on DeepseekV3; param keys are
+        # language_model.model.layers.* and must match checkpoint names after mapping.
+        if isinstance(self.quant_config, (ModelSlimConfig, QuarkConfig)):
+            return name
+        return name.replace("language_model.", "", 1)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Stream weights, loading vision weights inline and yielding language weights.
 
@@ -778,10 +785,12 @@ class KimiK25ForConditionalGeneration(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
                     continue
-                yield name.replace("language_model.", ""), loaded_weight
+                yield self._map_language_model_weight_name(name), loaded_weight
 
         if self.language_model is not None:
             self.language_model.load_weights(stream_language_weights())
+            # Always populate MLA absorbed w_kc/w_vc (required for NPU graph capture).
+            self.language_model.post_load_weights(weight_names=None)
         else:
             # encoder-only: drain the generator so inline vision-weight loading fires.
             for _ in stream_language_weights():
