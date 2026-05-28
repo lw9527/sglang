@@ -538,10 +538,26 @@ class SchedulerPPMixin:
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
-        # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
-        self.require_attn_tp_allgather = (
-            not self.server_args.enable_dsa_prefill_context_parallel
-        )
+        # [PD-PP-FIX] The send-allgather optimization in pp_group.send_tensor_dict
+        # (each attn_tp rank sends only its 1/attn_tp_size slice and the receiver
+        # all_gathers to rebuild the full tensor) is only correct when the tensor
+        # is REPLICATED across attn_tp_group — i.e. ScatterMode.TP_ATTN_FULL.
+        #
+        # For DeepSeek-V3/Kimi-K2.5 with --moe-a2a-backend deepep, every sparse
+        # layer's layer_output_mode is ScatterMode.SCATTERED (see
+        # LayerScatterModes._compute_mlp_mode -> _compute_layer_output_mode), so
+        # hidden_states/residual at every non-last PP rank boundary are SCATTERED
+        # (different content per attn_tp rank). Applying the optimization there
+        # silently mashes four ranks' scattered slices into garbage of the right
+        # shape, which corrupts every layer after the first PP stage and yields
+        # fluent-but-irrelevant generations (the symptom we see at TP=4 PP=4
+        # while TP=16 PP=1 works).
+        #
+        # The send-side slicing has no visibility into the upstream scatter
+        # mode, so we conservatively disable the optimization at every PP send.
+        # Cost: ~attn_tp_size x bandwidth at PP boundaries (still small vs MoE
+        # compute). Benefit: correctness for SCATTERED PP boundaries.
+        self.require_attn_tp_allgather = False
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
