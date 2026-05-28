@@ -91,6 +91,10 @@ class PrefillRankInfo:
 
 
 class CommonKVManager(BaseKVManager):
+    # ===== [PD-PP-DEBUG] counters (class-level) =====
+    _PD_PP_DEBUG_SLICE_COUNT = 0
+    _PD_PP_DEBUG_LOG_LIMIT = 50
+
     def __init__(
         self,
         args: KVArgs,
@@ -469,8 +473,33 @@ class CommonKVManager(BaseKVManager):
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
     ) -> Tuple[List[int], List[int], int]:
+        # ===== [PD-PP-DEBUG] slice log (rate-limited) =====
+        _pd_pp_log = getattr(CommonKVManager, "_PD_PP_DEBUG_SLICE_COUNT", 0) < getattr(
+            CommonKVManager, "_PD_PP_DEBUG_LOG_LIMIT", 50
+        )
+        if _pd_pp_log:
+            CommonKVManager._PD_PP_DEBUG_SLICE_COUNT = (
+                getattr(CommonKVManager, "_PD_PP_DEBUG_SLICE_COUNT", 0) + 1
+            )
+
         # Fast path: both sides use exactly the same PP layout
         if len(src_kv_ptrs) == len(dst_kv_ptrs):
+            if _pd_pp_log:
+                logger.warning(
+                    "[PD-PP-DEBUG][P][slice#%d] branch=fast_path pp_rank=%s "
+                    "engine_rank=%s prefill_start_layer=%s prefill_end_layer=%s "
+                    "kv_buf_groups=%s total_kv_layers=%s "
+                    "len(src_kv_ptrs)=%s len(dst_kv_ptrs)=%s",
+                    CommonKVManager._PD_PP_DEBUG_SLICE_COUNT,
+                    getattr(self, "pp_rank", None),
+                    getattr(self.kv_args, "engine_rank", None),
+                    getattr(self.kv_args, "prefill_start_layer", None),
+                    getattr(self.kv_args, "prefill_end_layer", None),
+                    getattr(self.kv_args, "kv_buf_groups", None),
+                    getattr(self.kv_args, "total_kv_layers", None),
+                    len(src_kv_ptrs),
+                    len(dst_kv_ptrs),
+                )
             return src_kv_ptrs, dst_kv_ptrs, len(src_kv_ptrs)
 
         mla_ratios = getattr(self.kv_args, "mla_compression_ratios", None)
@@ -482,6 +511,25 @@ class CommonKVManager(BaseKVManager):
             sliced_src_kv_ptrs, sliced_dst_kv_ptrs = self._mla_slice_ptrs_for_pp(
                 src_kv_ptrs, dst_kv_ptrs, mla_ratios
             )
+            if _pd_pp_log:
+                logger.warning(
+                    "[PD-PP-DEBUG][P][slice#%d] branch=v4_compressed pp_rank=%s "
+                    "engine_rank=%s prefill_start_layer=%s prefill_end_layer=%s "
+                    "kv_buf_groups=%s total_kv_layers=%s "
+                    "len(src_kv_ptrs_in)=%s len(dst_kv_ptrs_in)=%s "
+                    "len(sliced_src_kv_ptrs)=%s len(sliced_dst_kv_ptrs)=%s",
+                    CommonKVManager._PD_PP_DEBUG_SLICE_COUNT,
+                    getattr(self, "pp_rank", None),
+                    getattr(self.kv_args, "engine_rank", None),
+                    getattr(self.kv_args, "prefill_start_layer", None),
+                    getattr(self.kv_args, "prefill_end_layer", None),
+                    getattr(self.kv_args, "kv_buf_groups", None),
+                    getattr(self.kv_args, "total_kv_layers", None),
+                    len(src_kv_ptrs),
+                    len(dst_kv_ptrs),
+                    len(sliced_src_kv_ptrs),
+                    len(sliced_dst_kv_ptrs),
+                )
             return (
                 sliced_src_kv_ptrs,
                 sliced_dst_kv_ptrs,
@@ -493,6 +541,29 @@ class CommonKVManager(BaseKVManager):
         end_layer = start_layer + len(src_kv_ptrs)
         # Decode pp size should be equal to prefill pp size or 1
         sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
+        if _pd_pp_log:
+            logger.warning(
+                "[PD-PP-DEBUG][P][slice#%d] branch=regular_mla pp_rank=%s "
+                "engine_rank=%s prefill_start_layer=%s prefill_end_layer=%s "
+                "kv_buf_groups=%s total_kv_layers=%s "
+                "start_layer=%s end_layer=%s "
+                "len(src_kv_ptrs)=%s len(dst_kv_ptrs_in)=%s "
+                "len(sliced_dst_kv_ptrs)=%s "
+                "WARN_if_kv_buf_groups>1=%s",
+                CommonKVManager._PD_PP_DEBUG_SLICE_COUNT,
+                getattr(self, "pp_rank", None),
+                getattr(self.kv_args, "engine_rank", None),
+                getattr(self.kv_args, "prefill_start_layer", None),
+                getattr(self.kv_args, "prefill_end_layer", None),
+                getattr(self.kv_args, "kv_buf_groups", None),
+                getattr(self.kv_args, "total_kv_layers", None),
+                start_layer,
+                end_layer,
+                len(src_kv_ptrs),
+                len(dst_kv_ptrs),
+                len(sliced_dst_kv_ptrs),
+                (getattr(self.kv_args, "kv_buf_groups", 1) or 1) > 1,
+            )
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
 
     def _mla_slice_ptrs_for_pp(

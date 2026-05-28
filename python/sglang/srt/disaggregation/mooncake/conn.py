@@ -152,6 +152,12 @@ class KVArgsRegisterInfo:
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
 
+    # ===== [PD-PP-DEBUG] counters (class-level) =====
+    _PD_PP_DEBUG_DISPATCH_COUNT = 0
+    _PD_PP_DEBUG_SEND_COUNT = 0
+    _PD_PP_DEBUG_SEND_LOG_LIMIT = 50
+    _PD_PP_DEBUG_DISPATCH_LOG_LIMIT = 100
+
     def __init__(
         self,
         args: KVArgs,
@@ -573,6 +579,49 @@ class MooncakeKVManager(CommonKVManager):
         Generic KV cache transfer supporting both MHA and MLA architectures.
         This method is used by both send_kvcache (full pool) and maybe_send_extra.
         """
+        # ===== [PD-PP-DEBUG] send entry log (rate-limited) =====
+        _pd_pp_log = (
+            MooncakeKVManager._PD_PP_DEBUG_SEND_COUNT
+            < MooncakeKVManager._PD_PP_DEBUG_SEND_LOG_LIMIT
+        )
+        if _pd_pp_log:
+            MooncakeKVManager._PD_PP_DEBUG_SEND_COUNT += 1
+            try:
+                logger.warning(
+                    "[PD-PP-DEBUG][P][send#%d-enter] pp_rank=%s engine_rank=%s "
+                    "session=...%s n_prefill_indices=%s n_dst_indices=%s "
+                    "n_src_data_ptrs=%s n_dst_data_ptrs=%s n_item_lens=%s "
+                    "first_item_len=%s last_item_len=%s "
+                    "prefill_start_layer=%s prefill_end_layer=%s "
+                    "kv_buf_groups=%s total_kv_layers=%s "
+                    "is_mla=%s pp_size=%s enable_custom_mem_pool=%s",
+                    MooncakeKVManager._PD_PP_DEBUG_SEND_COUNT,
+                    getattr(self, "pp_rank", None),
+                    getattr(self.kv_args, "engine_rank", None),
+                    str(mooncake_session_id)[-12:],
+                    (
+                        len(prefill_data_indices)
+                        if prefill_data_indices is not None
+                        else 0
+                    ),
+                    len(dst_data_indices) if dst_data_indices is not None else 0,
+                    len(src_data_ptrs) if src_data_ptrs else 0,
+                    len(dst_data_ptrs) if dst_data_ptrs else 0,
+                    len(item_lens) if item_lens else 0,
+                    item_lens[0] if item_lens else None,
+                    item_lens[-1] if item_lens else None,
+                    getattr(self.kv_args, "prefill_start_layer", None),
+                    getattr(self.kv_args, "prefill_end_layer", None),
+                    getattr(self.kv_args, "kv_buf_groups", None),
+                    getattr(self.kv_args, "total_kv_layers", None),
+                    self.is_mla_backend,
+                    getattr(self, "pp_size", None),
+                    getattr(self, "enable_custom_mem_pool", None),
+                )
+            except Exception as _e:
+                logger.warning(f"[PD-PP-DEBUG][P][send-enter] log failed: {_e}")
+        # ===== [PD-PP-DEBUG] END =====
+
         # Group by indices for optimization
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_data_indices, dst_data_indices
@@ -645,6 +694,25 @@ class MooncakeKVManager(CommonKVManager):
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
+        # ===== [PD-PP-DEBUG] helper to log + return =====
+        def _pd_pp_log_send_ret(ret: int, branch: str) -> int:
+            if _pd_pp_log:
+                try:
+                    logger.warning(
+                        "[PD-PP-DEBUG][P][send#%d-ret] pp_rank=%s engine_rank=%s "
+                        "session=...%s branch=%s n_layers_params=%s ret=%s",
+                        MooncakeKVManager._PD_PP_DEBUG_SEND_COUNT,
+                        getattr(self, "pp_rank", None),
+                        getattr(self.kv_args, "engine_rank", None),
+                        str(mooncake_session_id)[-12:],
+                        branch,
+                        len(layers_params) if layers_params else 0,
+                        ret,
+                    )
+                except Exception as _e:
+                    logger.warning(f"[PD-PP-DEBUG][P][send-ret] log failed: {_e}")
+            return ret
+
         if self.enable_custom_mem_pool:
             futures = [
                 executor.submit(
@@ -660,12 +728,14 @@ class MooncakeKVManager(CommonKVManager):
                 if status != 0:
                     for f in futures:
                         f.cancel()
-                    return status
-            return 0
+                    return _pd_pp_log_send_ret(status, "custom_mem_pool_failed")
+            return _pd_pp_log_send_ret(0, "custom_mem_pool_all_ok")
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
-            return process_layers(layers_params)
+            return _pd_pp_log_send_ret(
+                process_layers(layers_params), "process_layers_batch"
+            )
 
     def send_kvcache(
         self,
@@ -1201,6 +1271,65 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+
+                        # ===== [PD-PP-DEBUG] dispatch decision log (rate-limited) =====
+                        if (
+                            MooncakeKVManager._PD_PP_DEBUG_DISPATCH_COUNT
+                            < MooncakeKVManager._PD_PP_DEBUG_DISPATCH_LOG_LIMIT
+                        ):
+                            MooncakeKVManager._PD_PP_DEBUG_DISPATCH_COUNT += 1
+                            try:
+                                if len(kv_chunk.prefill_kv_indices) == 0:
+                                    _branch = "empty_skip"
+                                elif self.is_mla_backend or (
+                                    self.attn_tp_size
+                                    == target_rank_registration_info.dst_attn_tp_size
+                                ):
+                                    _branch = "send_kvcache"
+                                elif (
+                                    self.enable_staging
+                                    and staging_strategy is not None
+                                    and target_rank_registration_info.staging
+                                    is not None
+                                ):
+                                    _branch = "staging"
+                                else:
+                                    _branch = "send_kvcache_slice"
+                                logger.warning(
+                                    "[PD-PP-DEBUG][P][dispatch#%d] room=%s pp_rank=%s "
+                                    "attn_tp_rank=%s attn_tp_size=%s dst_attn_tp_size=%s "
+                                    "is_mla=%s n_prefill_indices=%s n_dst_kv_indices=%s "
+                                    "n_dst_kv_ptrs=%s is_last_chunk=%s dst_tp_rank=%s "
+                                    "session=...%s branch=%s",
+                                    MooncakeKVManager._PD_PP_DEBUG_DISPATCH_COUNT,
+                                    getattr(kv_chunk, "room", None),
+                                    getattr(self, "pp_rank", None),
+                                    getattr(self, "attn_tp_rank", None),
+                                    self.attn_tp_size,
+                                    target_rank_registration_info.dst_attn_tp_size,
+                                    self.is_mla_backend,
+                                    len(kv_chunk.prefill_kv_indices),
+                                    (
+                                        len(chunked_dst_kv_indice)
+                                        if chunked_dst_kv_indice is not None
+                                        else 0
+                                    ),
+                                    (
+                                        len(target_rank_registration_info.dst_kv_ptrs)
+                                        if target_rank_registration_info.dst_kv_ptrs
+                                        else 0
+                                    ),
+                                    getattr(kv_chunk, "is_last_chunk", None),
+                                    target_rank_registration_info.dst_tp_rank,
+                                    str(req.mooncake_session_id)[-12:],
+                                    _branch,
+                                )
+                            except Exception as _e:
+                                logger.warning(
+                                    f"[PD-PP-DEBUG][P][dispatch] log failed: {_e}"
+                                )
+                        # ===== [PD-PP-DEBUG] END =====
+
                         if len(kv_chunk.prefill_kv_indices) == 0:
                             ret = 0
                         elif self.is_mla_backend or (

@@ -202,6 +202,41 @@ class PrefillBootstrapQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+
+        # ===== [PD-PP-DEBUG] BEGIN: per-PP-rank init log (one-shot) =====
+        try:
+            logger.warning(
+                "[PD-PP-DEBUG][P][init] pp_rank=%s pp_size=%s tp_rank=%s tp_size=%s "
+                "engine_rank=%s system_dp_rank=%s is_mla=%s pool_type=%s "
+                "prefill_start_layer=%s prefill_end_layer=%s "
+                "kv_buf_groups=%s total_kv_layers=%s "
+                "n_kv_data_ptrs=%s n_kv_item_lens=%s first_kv_item_len=%s last_kv_item_len=%s "
+                "n_aux_ptrs=%s page_size=%s gpu_id=%s "
+                "transfer_backend=%s",
+                self.pp_rank,
+                self.pp_size,
+                self.tp_rank,
+                self.tp_size,
+                kv_args.engine_rank,
+                getattr(kv_args, "system_dp_rank", None),
+                self.is_mla_backend,
+                type(self.token_to_kv_pool).__name__,
+                getattr(kv_args, "prefill_start_layer", None),
+                getattr(kv_args, "prefill_end_layer", None),
+                getattr(kv_args, "kv_buf_groups", None),
+                getattr(kv_args, "total_kv_layers", None),
+                len(kv_args.kv_data_ptrs) if kv_args.kv_data_ptrs else 0,
+                len(kv_args.kv_item_lens) if kv_args.kv_item_lens else 0,
+                kv_args.kv_item_lens[0] if kv_args.kv_item_lens else None,
+                kv_args.kv_item_lens[-1] if kv_args.kv_item_lens else None,
+                len(kv_args.aux_data_ptrs) if kv_args.aux_data_ptrs else 0,
+                kv_args.page_size,
+                kv_args.gpu_id,
+                self.transfer_backend,
+            )
+        except Exception as _e:
+            logger.warning(f"[PD-PP-DEBUG][P][init] log failed: {_e}")
+        # ===== [PD-PP-DEBUG] END =====
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
