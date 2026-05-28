@@ -536,33 +536,63 @@ class CommonKVManager(BaseKVManager):
                 len(sliced_src_kv_ptrs),
             )
 
-        # Regular MLA PP slicing
+        # Regular MLA PP slicing.
+        #
+        # The src/dst flat lists may be organized into `kv_buf_groups` parallel
+        # sections of the same length (e.g. NPUMLATokenToKVPool returns
+        # [K_layer_0..K_layer_{L-1}, V_layer_0..V_layer_{L-1}] when K and V
+        # are stored as separate buffers with kv_buf_groups=2). The K and V
+        # item sizes can also differ (kv_lora_rank vs qk_rope_head_dim), so
+        # treating the flat list as a single contiguous per-layer sequence
+        # would mix groups across the cut point.
+        #
+        # Slicing rules:
+        #   - src_layers       = len(src_kv_ptrs) // kv_buf_groups
+        #   - dst_per_group    = len(dst_kv_ptrs) // kv_buf_groups, clamped
+        #                        to total_kv_layers when the decode pool
+        #                        appends extra layers (e.g. draft/MTP).
+        #   - For each group i, append dst[i*dst_per_group + start_layer :
+        #                               i*dst_per_group + end_layer].
+        # When kv_buf_groups == 1 this reduces to the old behaviour.
         start_layer = self.kv_args.prefill_start_layer
-        end_layer = start_layer + len(src_kv_ptrs)
-        # Decode pp size should be equal to prefill pp size or 1
-        sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
+        kv_buf_groups = getattr(self.kv_args, "kv_buf_groups", 1) or 1
+        total_kv_layers = getattr(self.kv_args, "total_kv_layers", 0) or 0
+        src_layers = len(src_kv_ptrs) // kv_buf_groups
+        dst_per_group = len(dst_kv_ptrs) // kv_buf_groups
+        if total_kv_layers:
+            dst_per_group = min(dst_per_group, total_kv_layers)
+        end_layer = start_layer + src_layers
+        if src_layers == dst_per_group:
+            sliced_dst_kv_ptrs = dst_kv_ptrs
+        else:
+            sliced_dst_kv_ptrs = []
+            for i in range(kv_buf_groups):
+                offset = i * dst_per_group
+                sliced_dst_kv_ptrs.extend(
+                    dst_kv_ptrs[offset + start_layer : offset + end_layer]
+                )
         if _pd_pp_log:
             logger.warning(
                 "[PD-PP-DEBUG][P][slice#%d] branch=regular_mla pp_rank=%s "
                 "engine_rank=%s prefill_start_layer=%s prefill_end_layer=%s "
                 "kv_buf_groups=%s total_kv_layers=%s "
-                "start_layer=%s end_layer=%s "
+                "start_layer=%s end_layer=%s src_layers=%s dst_per_group=%s "
                 "len(src_kv_ptrs)=%s len(dst_kv_ptrs_in)=%s "
-                "len(sliced_dst_kv_ptrs)=%s "
-                "WARN_if_kv_buf_groups>1=%s",
+                "len(sliced_dst_kv_ptrs)=%s",
                 CommonKVManager._PD_PP_DEBUG_SLICE_COUNT,
                 getattr(self, "pp_rank", None),
                 getattr(self.kv_args, "engine_rank", None),
                 getattr(self.kv_args, "prefill_start_layer", None),
                 getattr(self.kv_args, "prefill_end_layer", None),
-                getattr(self.kv_args, "kv_buf_groups", None),
-                getattr(self.kv_args, "total_kv_layers", None),
+                kv_buf_groups,
+                total_kv_layers,
                 start_layer,
                 end_layer,
+                src_layers,
+                dst_per_group,
                 len(src_kv_ptrs),
                 len(dst_kv_ptrs),
                 len(sliced_dst_kv_ptrs),
-                (getattr(self.kv_args, "kv_buf_groups", 1) or 1) > 1,
             )
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
 
