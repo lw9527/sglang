@@ -538,26 +538,55 @@ class SchedulerPPMixin:
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
-        # [PD-PP-FIX] The send-allgather optimization in pp_group.send_tensor_dict
-        # (each attn_tp rank sends only its 1/attn_tp_size slice and the receiver
-        # all_gathers to rebuild the full tensor) is only correct when the tensor
-        # is REPLICATED across attn_tp_group — i.e. ScatterMode.TP_ATTN_FULL.
+        # The send-allgather optimization in pp_group.send_tensor_dict (each
+        # attn_tp rank sends only its 1/attn_tp_size slice and the receiver
+        # all_gathers to rebuild the full tensor) is correct ONLY when the
+        # PP-boundary tensor is REPLICATED across the attn_tp_group, i.e.
+        # ScatterMode.TP_ATTN_FULL.
         #
-        # For DeepSeek-V3/Kimi-K2.5 with --moe-a2a-backend deepep, every sparse
-        # layer's layer_output_mode is ScatterMode.SCATTERED (see
-        # LayerScatterModes._compute_mlp_mode -> _compute_layer_output_mode), so
-        # hidden_states/residual at every non-last PP rank boundary are SCATTERED
-        # (different content per attn_tp rank). Applying the optimization there
-        # silently mashes four ranks' scattered slices into garbage of the right
-        # shape, which corrupts every layer after the first PP stage and yields
-        # fluent-but-irrelevant generations (the symptom we see at TP=4 PP=4
-        # while TP=16 PP=1 works).
+        # When the PP-boundary tensor is SCATTERED (different content per
+        # attn_tp rank), the send side double-slices each rank's local data
+        # and the receiver concatenates N different ranks' partial slices
+        # into garbage of the correct shape, silently corrupting hidden_states
+        # at every non-final PP boundary (the teens->95 GSM8K bug at TP4/PP4).
         #
-        # The send-side slicing has no visibility into the upstream scatter
-        # mode, so we conservatively disable the optimization at every PP send.
-        # Cost: ~attn_tp_size x bandwidth at PP boundaries (still small vs MoE
-        # compute). Benefit: correctness for SCATTERED PP boundaries.
-        self.require_attn_tp_allgather = False
+        # See LayerScatterModes._compute_layer_output_mode in
+        # python/sglang/srt/layers/communicator.py. A PP boundary is SCATTERED
+        # when pp_size > 1 and any of: CP prefill, --moe-a2a-backend != none
+        # (sparse layers SCATTERED on DeepSeek-V3-class models), or
+        # --moe-dense-tp-size 1. In those cases the optimization is disabled so
+        # each rank sends its full local tensor and the scatter mode is
+        # preserved end-to-end.
+        args = self.server_args
+        moe_a2a_active = getattr(args, "moe_a2a_backend", "none") not in (
+            None,
+            "none",
+            "",
+        )
+        moe_dense_fully_dp = getattr(args, "moe_dense_tp_size", None) == 1
+        pp_boundary_can_be_scattered = self.ps.pp_size > 1 and (
+            args.enable_dsa_prefill_context_parallel
+            or moe_a2a_active
+            or moe_dense_fully_dp
+        )
+        self.require_attn_tp_allgather = not pp_boundary_can_be_scattered
+
+        # PP-boundary residual folding: a layer-boundary proxy carries the
+        # summable pair (hidden_states, residual) where the next stage only
+        # needs their sum (CommunicateSummableTensorPairFn documents that
+        # (hidden_states, residual) := (hidden_states + residual, None) is
+        # always allowed, and _gather does exactly this). When the optimization
+        # above is disabled the proxy is sent at full size, so folding the two
+        # tensors into one (hidden_states + residual) halves the per-boundary
+        # P2P volume with no accuracy change: x + 0 == x. The receiver rebuilds
+        # residual as a zero tensor so model code stays untouched.
+        #
+        # Skip folding under --enable-attn-tp-input-scattered: there the next
+        # stage reduce-scatters hidden_states, so hidden_states and residual
+        # are not in the same scatter mode and are not summable.
+        self.pp_fold_residual_into_hidden = not getattr(
+            args, "enable_attn_tp_input_scattered", False
+        )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
@@ -983,6 +1012,39 @@ class SchedulerPPMixin:
             }
         return tensor_dict
 
+    # Marker placed in the proxy dict (as cheap metadata) when hidden_states
+    # and residual have been folded into a single hidden_states = sum tensor.
+    _PP_RESIDUAL_FOLDED_KEY = "__residual_folded__"
+
+    def _pp_maybe_fold_residual(
+        self: Scheduler, tensor_dict: Dict[str, torch.Tensor]
+    ) -> None:
+        """In-place fold hidden_states + residual into hidden_states.
+
+        Only folds when both tensors are present, are real same-shaped tensors,
+        and residual is non-empty. The next stage rebuilds residual as zeros,
+        which is numerically identical because hidden_states + 0 == sum.
+        """
+        hidden_states = tensor_dict.get("hidden_states")
+        residual = tensor_dict.get("residual")
+        if (
+            not isinstance(hidden_states, torch.Tensor)
+            or not isinstance(residual, torch.Tensor)
+            or residual.numel() == 0
+            or hidden_states.shape != residual.shape
+        ):
+            return
+        tensor_dict["hidden_states"] = hidden_states + residual
+        del tensor_dict["residual"]
+        tensor_dict[self._PP_RESIDUAL_FOLDED_KEY] = True
+
+    def _pp_maybe_unfold_residual(
+        self: Scheduler, tensor_dict: Dict[str, torch.Tensor]
+    ) -> None:
+        """Inverse of _pp_maybe_fold_residual: rebuild residual as zeros."""
+        if tensor_dict.pop(self._PP_RESIDUAL_FOLDED_KEY, False):
+            tensor_dict["residual"] = torch.zeros_like(tensor_dict["hidden_states"])
+
     def _pp_send_dict_to_next_stage(
         self: Scheduler,
         tensor_dict: Dict[str, torch.Tensor],
@@ -996,6 +1058,11 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        # Fold the summable (hidden_states, residual) proxy pair into a single
+        # tensor to halve the cross-stage P2P volume. The next stage only needs
+        # hidden_states + residual; it rebuilds residual as zeros on recv.
+        if msg_type == "proxy" and getattr(self, "pp_fold_residual_into_hidden", False):
+            self._pp_maybe_fold_residual(tensor_dict)
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
@@ -1044,14 +1111,14 @@ class SchedulerPPMixin:
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
-            pp_proxy_tensors = PPProxyTensors(
-                self._pp_recv_typed_dict(
-                    expected_kind="proxy",
-                    all_gather_group=(
-                        self.attn_tp_group if self.require_attn_tp_allgather else None
-                    ),
-                )
+            tensor_dict = self._pp_recv_typed_dict(
+                expected_kind="proxy",
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                ),
             )
+            self._pp_maybe_unfold_residual(tensor_dict)
+            pp_proxy_tensors = PPProxyTensors(tensor_dict)
         return pp_proxy_tensors
 
     def _pp_recv_dict_from_prev_stage(
