@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.hicache_debug import log_hicache, req_brief
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
@@ -821,12 +822,28 @@ class PrefillAdder:
                     return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
+                log_hicache(
+                    "prefill_adder_load_back",
+                    cache=self.tree_cache,
+                    req_id=req.rid,
+                    host_hit_length=req.host_hit_length,
+                    rem_total=self.rem_total_tokens,
+                    rem_input=self.rem_input_tokens,
+                    info=req_brief(req),
+                )
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         last_host_node=req.last_host_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
                     )
+                )
+                log_hicache(
+                    "prefill_adder_load_back_done",
+                    cache=self.tree_cache,
+                    req_id=req.rid,
+                    loaded_tokens=len(new_indices),
+                    info=req_brief(req),
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))

@@ -188,6 +188,11 @@ from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.hicache_debug import (
+    log_hicache,
+    req_brief,
+    snapshot_hicache_state,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -2439,6 +2444,14 @@ class Scheduler(
                 self._add_request_to_queue(req)
 
         if self.enable_hierarchical_cache:
+            log_hicache(
+                "scheduler_check_hicache_events",
+                cache=self.tree_cache,
+                waiting=len(self.waiting_queue),
+                running=len(self.running_batch.reqs),
+                chunked=1 if self.chunked_req is not None else 0,
+                **snapshot_hicache_state(self.tree_cache),
+            )
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption:
@@ -2544,6 +2557,13 @@ class Scheduler(
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
+                    log_hicache(
+                        "scheduler_skip_prefetch",
+                        cache=self.tree_cache,
+                        req_id=req.rid,
+                        info=req_brief(req),
+                        **snapshot_hicache_state(self.tree_cache),
+                    )
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
@@ -2552,6 +2572,14 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            log_hicache(
+                "scheduler_prefill_try_add",
+                cache=self.tree_cache,
+                req_id=req.rid,
+                info=req_brief(req),
+                can_run=len(adder.can_run_list),
+                batch_full=self.running_batch.batch_is_full,
+            )
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -2562,6 +2590,14 @@ class Scheduler(
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
+                log_hicache(
+                    "scheduler_prefill_add_blocked",
+                    cache=self.tree_cache,
+                    req_id=req.rid,
+                    result=res.name,
+                    info=req_brief(req),
+                    **snapshot_hicache_state(self.tree_cache),
+                )
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
@@ -2582,6 +2618,17 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            if self.enable_hierarchical_cache and len(self.waiting_queue) > 0:
+                head = self.waiting_queue[0]
+                log_hicache(
+                    "scheduler_prefill_no_batch",
+                    cache=self.tree_cache,
+                    waiting=len(self.waiting_queue),
+                    head_rid=head.rid,
+                    head_info=req_brief(head),
+                    batch_full=self.running_batch.batch_is_full,
+                    **snapshot_hicache_state(self.tree_cache),
+                )
             return None
 
         can_run_set = set(can_run_list)
@@ -2619,8 +2666,15 @@ class Scheduler(
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
-            new_batch.hicache_consumer_index = (
-                self.tree_cache.ready_to_load_host_cache()
+            consumer_index = self.tree_cache.ready_to_load_host_cache()
+            new_batch.hicache_consumer_index = consumer_index
+            log_hicache(
+                "scheduler_prefill_batch_ready",
+                cache=self.tree_cache,
+                batch_size=len(can_run_list),
+                consumer_index=consumer_index,
+                rids=[r.rid for r in can_run_list],
+                **snapshot_hicache_state(self.tree_cache),
             )
 
         new_batch.prepare_for_extend()
@@ -3763,6 +3817,7 @@ def run_scheduler_process(
     if _is_npu:
         # init zbal if is set
         from sglang.srt.hardware_backend.npu.utils import init_zbal
+
         init_zbal(server_args.tp_size, gpu_id, tp_rank)
     dp_rank = configure_scheduler_process(
         server_args,

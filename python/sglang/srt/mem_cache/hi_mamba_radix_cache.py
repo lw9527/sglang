@@ -22,6 +22,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hicache_debug import (
+    log_event_sync,
+    log_hicache,
+    log_hicache_block,
+    snapshot_hicache_state,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
@@ -230,6 +236,14 @@ class HiMambaRadixCache(MambaRadixCache):
                 self.mamba_backup_commit(node, extra_pools)
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
+            log_hicache(
+                "write_backup_queued",
+                cache=self,
+                node_id=node.id,
+                num_tokens=len(host_indices),
+                write_back=write_back,
+                ongoing_write=len(self.ongoing_write_through),
+            )
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
@@ -276,10 +290,27 @@ class HiMambaRadixCache(MambaRadixCache):
             )
             and len(mamba_restore_nodes) == 0
         ):
+            log_hicache(
+                "load_back_skip",
+                cache=self,
+                node_id=last_hit_node.id,
+                num_tokens=len(full_host_indices),
+                threshold=self.load_back_threshold,
+                mem_quota=mem_quota,
+                delta=delta,
+            )
             # skip loading back if the total size is too small or exceeding the memory quota
             self.dec_lock_ref(ancestor_node)
             return None
 
+        log_hicache(
+            "load_back_start",
+            cache=self,
+            node_id=last_hit_node.id,
+            num_tokens=len(full_host_indices),
+            num_nodes=len(nodes_to_load),
+            mamba_nodes=len(mamba_restore_nodes),
+        )
         logger.debug(
             f"Init load back from cpu -> gpu, kv hit length: {len(full_host_indices)}, mamba host hit length: {len(mamba_restore_nodes)}"
         )
@@ -305,6 +336,12 @@ class HiMambaRadixCache(MambaRadixCache):
             )
         self.dec_lock_ref(ancestor_node)
         if full_device_indices is None:
+            log_hicache(
+                "load_back_failed",
+                cache=self,
+                node_id=last_hit_node.id,
+                num_tokens=len(full_host_indices),
+            )
             # no sufficient GPU memory to load back KV caches
             return None
 
@@ -331,6 +368,13 @@ class HiMambaRadixCache(MambaRadixCache):
 
         self.inc_lock_ref(last_hit_node)
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
+        log_hicache(
+            "load_back_queued",
+            cache=self,
+            node_id=last_hit_node.id,
+            num_tokens=len(full_device_indices),
+            ongoing_load=len(self.ongoing_load_back),
+        )
 
         return full_device_indices
 
@@ -342,6 +386,13 @@ class HiMambaRadixCache(MambaRadixCache):
         mem_quota = params.mem_quota
         req = params.req
         if last_node.evicted or (last_node.mamba_evicted and last_node.mamba_backuped):
+            log_hicache(
+                "init_load_back",
+                cache=self,
+                node_id=last_node.id,
+                host_hit_length=params.host_hit_length,
+                mem_quota=mem_quota,
+            )
             loading_values = self.load_back(last_node, mem_quota, req=req)
             if loading_values is not None:
                 logger.debug(
@@ -370,10 +421,24 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def writing_check(self, write_back=False):
         if write_back:
+            log_hicache(
+                "writing_check_write_back_wait",
+                cache=self,
+                throttle_key="writing_check_write_back",
+                ongoing_write=len(self.ongoing_write_through),
+                ack_write_q=len(self.cache_controller.ack_write_queue),
+                **snapshot_hicache_state(self),
+            )
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
                 for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                    finish_event.synchronize()
+                    log_event_sync(
+                        "write_back",
+                        finish_event,
+                        cache=self,
+                        ack_nodes=len(ack_list),
+                        ongoing_write=len(self.ongoing_write_through),
+                    )
                     for ack_id in ack_list:
                         backuped_node = self.ongoing_write_through.pop(ack_id)
                         if self.enable_storage:
@@ -388,6 +453,14 @@ class HiMambaRadixCache(MambaRadixCache):
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
             if not finish_event.query():
+                log_hicache(
+                    "writing_check_pending",
+                    cache=self,
+                    throttle_key="writing_check_pending",
+                    finish_count=finish_count,
+                    ack_write_q=len(self.cache_controller.ack_write_queue),
+                    ongoing_write=len(self.ongoing_write_through),
+                )
                 break
             finish_count += 1
 
@@ -402,7 +475,13 @@ class HiMambaRadixCache(MambaRadixCache):
 
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
+            log_event_sync(
+                "write_through",
+                finish_event,
+                cache=self,
+                ack_nodes=len(ack_list),
+                remaining=finish_count - 1,
+            )
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 self.dec_lock_ref(backuped_node)
@@ -414,6 +493,14 @@ class HiMambaRadixCache(MambaRadixCache):
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
             if not finish_event.query():
+                log_hicache(
+                    "loading_check_pending",
+                    cache=self,
+                    throttle_key="loading_check_pending",
+                    finish_count=finish_count,
+                    ack_load_q=len(self.cache_controller.ack_load_queue),
+                    ongoing_load=len(self.ongoing_load_back),
+                )
                 # the KV cache loading is still ongoing
                 break
             finish_count += 1
@@ -424,21 +511,35 @@ class HiMambaRadixCache(MambaRadixCache):
         del self.cache_controller.ack_load_queue[:finish_count]
 
     def ready_to_load_host_cache(self) -> int:
-        return self.cache_controller.start_loading()
+        load_q = len(self.cache_controller.load_queue)
+        consumer_index = self.cache_controller.start_loading()
+        log_hicache(
+            "ready_to_load_host_cache",
+            cache=self,
+            load_q_before=load_q,
+            consumer_index=consumer_index,
+            **snapshot_hicache_state(self),
+        )
+        return consumer_index
 
     def flush_write_through_acks(self) -> None:
         self.writing_check()
 
     def check_hicache_events(self):
-        self.writing_check()
-        self.loading_check()
+        with log_hicache_block(
+            "check_hicache_events",
+            cache=self,
+            **snapshot_hicache_state(self),
+        ):
+            self.writing_check()
+            self.loading_check()
 
-        if self.enable_storage:
-            self.drain_storage_control_queues()
-        if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_storage_metrics(
-                self.cache_controller.storage_backend.get_stats()
-            )
+            if self.enable_storage:
+                self.drain_storage_control_queues()
+            if self.enable_storage_metrics:
+                self.storage_metrics_collector.log_storage_metrics(
+                    self.cache_controller.storage_backend.get_stats()
+                )
 
     def _protect_host_node(self, node: TreeNode, protect_mamba: bool = True):
         node.protect_host()
@@ -1747,6 +1848,19 @@ class HiMambaRadixCache(MambaRadixCache):
             return True
 
         if not self.can_terminate_prefetch(operation):
+            log_hicache(
+                "prefetch_not_done",
+                cache=self,
+                req_id=req_id,
+                throttle_key=f"prefetch_{req_id}",
+                completed=operation.completed_tokens,
+                total=(
+                    len(operation.hash_value) * self.page_size
+                    if operation.hash_value
+                    else 0
+                ),
+                policy=self.prefetch_stop_policy,
+            )
             return False
 
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(

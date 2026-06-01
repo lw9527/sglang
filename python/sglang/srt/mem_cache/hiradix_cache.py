@@ -25,6 +25,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hicache_debug import (
+    log_event_sync,
+    log_hicache,
+    log_hicache_block,
+    snapshot_hicache_state,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -674,6 +680,15 @@ class HiRadixCache(RadixCache):
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
+            log_hicache(
+                "write_backup_queued",
+                cache=self,
+                req_id="",
+                node_id=node.id,
+                num_tokens=len(host_indices),
+                write_back=write_back,
+                ongoing_write=len(self.ongoing_write_through),
+            )
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
@@ -712,10 +727,24 @@ class HiRadixCache(RadixCache):
 
     def writing_check(self, write_back=False):
         if write_back:
+            log_hicache(
+                "writing_check_write_back_wait",
+                cache=self,
+                throttle_key="writing_check_write_back",
+                ongoing_write=len(self.ongoing_write_through),
+                ack_write_q=len(self.cache_controller.ack_write_queue),
+                **snapshot_hicache_state(self),
+            )
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
                 for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                    finish_event.synchronize()
+                    log_event_sync(
+                        "write_back",
+                        finish_event,
+                        cache=self,
+                        ack_nodes=len(ack_list),
+                        ongoing_write=len(self.ongoing_write_through),
+                    )
                     for ack_id in ack_list:
                         backuped_node = self.ongoing_write_through.pop(ack_id)
                         if self.enable_storage:
@@ -731,6 +760,14 @@ class HiRadixCache(RadixCache):
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
             if not finish_event.query():
+                log_hicache(
+                    "writing_check_pending",
+                    cache=self,
+                    throttle_key="writing_check_pending",
+                    finish_count=finish_count,
+                    ack_write_q=len(self.cache_controller.ack_write_queue),
+                    ongoing_write=len(self.ongoing_write_through),
+                )
                 break
             finish_count += 1
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
@@ -745,7 +782,13 @@ class HiRadixCache(RadixCache):
         finish_count = int(queue_size.item())
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
+            log_event_sync(
+                "write_through",
+                finish_event,
+                cache=self,
+                ack_nodes=len(ack_list),
+                remaining=finish_count - 1,
+            )
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 self.dec_lock_ref(backuped_node)
@@ -757,6 +800,14 @@ class HiRadixCache(RadixCache):
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
             if not finish_event.query():
+                log_hicache(
+                    "loading_check_pending",
+                    cache=self,
+                    throttle_key="loading_check_pending",
+                    finish_count=finish_count,
+                    ack_load_q=len(self.cache_controller.ack_load_queue),
+                    ongoing_load=len(self.ongoing_load_back),
+                )
                 # the KV cache loading is still ongoing
                 break
             finish_count += 1
@@ -962,10 +1013,26 @@ class HiRadixCache(RadixCache):
         if len(host_indices) < self.load_back_threshold or (
             len(host_indices) > mem_quota + delta if mem_quota is not None else False
         ):
+            log_hicache(
+                "load_back_skip",
+                cache=self,
+                node_id=last_hit_node.id,
+                num_tokens=len(host_indices),
+                threshold=self.load_back_threshold,
+                mem_quota=mem_quota,
+                delta=delta,
+            )
             # skip loading back if the total size is too small or exceeding the memory quota
             self.dec_lock_ref(ancester_node)
             return None
 
+        log_hicache(
+            "load_back_start",
+            cache=self,
+            node_id=last_hit_node.id,
+            num_tokens=len(host_indices),
+            num_nodes=len(nodes_to_load),
+        )
         device_indices = self.cache_controller.load(
             host_indices=host_indices,
             node_id=last_hit_node.id,
@@ -981,6 +1048,13 @@ class HiRadixCache(RadixCache):
         self.dec_lock_ref(ancester_node)
         if device_indices is None:
             # no sufficient GPU memory to load back KV caches
+            log_hicache(
+                "load_back_failed",
+                cache=self,
+                node_id=last_hit_node.id,
+                num_tokens=len(host_indices),
+                evictable_size=self.evictable_size_,
+            )
             logger.warning(
                 "load_back: FAILED to load %d tokens for node %d "
                 "even after eviction (evictable_size=%d)",
@@ -998,6 +1072,14 @@ class HiRadixCache(RadixCache):
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
 
+        log_hicache(
+            "load_back_queued",
+            cache=self,
+            node_id=last_hit_node.id,
+            num_tokens=len(device_indices),
+            ongoing_load=len(self.ongoing_load_back),
+        )
+
         if self.metrics_collector is not None:
             self.metrics_collector.observe_load_back_duration(
                 time.perf_counter() - start_time
@@ -1013,6 +1095,13 @@ class HiRadixCache(RadixCache):
         last_node = params.last_host_node
         mem_quota = params.mem_quota
         if last_node.evicted:
+            log_hicache(
+                "init_load_back",
+                cache=self,
+                node_id=last_node.id,
+                host_hit_length=params.host_hit_length,
+                mem_quota=mem_quota,
+            )
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
                 logger.debug(
@@ -1033,20 +1122,34 @@ class HiRadixCache(RadixCache):
         Notify the cache controller to start the KV cache loading.
         Return the consumer index for the schedule batch manager to track.
         """
-        return self.cache_controller.start_loading()
+        load_q = len(self.cache_controller.load_queue)
+        consumer_index = self.cache_controller.start_loading()
+        log_hicache(
+            "ready_to_load_host_cache",
+            cache=self,
+            load_q_before=load_q,
+            consumer_index=consumer_index,
+            **snapshot_hicache_state(self),
+        )
+        return consumer_index
 
     def flush_write_through_acks(self) -> None:
         self.writing_check()
 
     def check_hicache_events(self):
-        self.writing_check()
-        self.loading_check()
-        if self.enable_storage:
-            self.drain_storage_control_queues()
-        if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_storage_metrics(
-                self.cache_controller.storage_backend.get_stats()
-            )
+        with log_hicache_block(
+            "check_hicache_events",
+            cache=self,
+            **snapshot_hicache_state(self),
+        ):
+            self.writing_check()
+            self.loading_check()
+            if self.enable_storage:
+                self.drain_storage_control_queues()
+            if self.enable_storage_metrics:
+                self.storage_metrics_collector.log_storage_metrics(
+                    self.cache_controller.storage_backend.get_stats()
+                )
 
     def drain_storage_control_queues(self):
         """
@@ -1140,6 +1243,19 @@ class HiRadixCache(RadixCache):
             return True
 
         if not self.can_terminate_prefetch(operation):
+            log_hicache(
+                "prefetch_not_done",
+                cache=self,
+                req_id=req_id,
+                throttle_key=f"prefetch_{req_id}",
+                completed=operation.completed_tokens,
+                total=(
+                    len(operation.hash_value) * self.page_size
+                    if operation.hash_value
+                    else 0
+                ),
+                policy=self.prefetch_stop_policy,
+            )
             return False
 
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
