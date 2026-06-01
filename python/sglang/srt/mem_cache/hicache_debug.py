@@ -41,14 +41,25 @@ def rank_tag_from_cache(cache: Any) -> str:
     )
 
 
+def _seq_len(value: Any) -> int:
+    if value is None:
+        return 0
+    if hasattr(value, "numel"):
+        return int(value.numel())
+    try:
+        return len(value)
+    except TypeError:
+        return 0
+
+
 def req_brief(req: Any) -> str:
     if req is None:
         return ""
     rid = getattr(req, "rid", "")
     extend_len = getattr(req, "extend_input_len", None)
     host_hit = getattr(req, "host_hit_length", None)
-    prefix_len = len(getattr(req, "prefix_indices", []) or [])
-    fill_len = len(getattr(req, "fill_ids", []) or [])
+    prefix_len = _seq_len(getattr(req, "prefix_indices", None))
+    fill_len = _seq_len(getattr(req, "fill_ids", None))
     return (
         f"rid={rid} extend={extend_len} host_hit={host_hit} "
         f"prefix={prefix_len} fill={fill_len}"
