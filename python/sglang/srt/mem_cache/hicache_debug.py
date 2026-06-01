@@ -44,25 +44,45 @@ def rank_tag_from_cache(cache: Any) -> str:
 def _seq_len(value: Any) -> int:
     if value is None:
         return 0
-    if hasattr(value, "numel"):
-        return int(value.numel())
     try:
+        numel = getattr(value, "numel", None)
+        if callable(numel):
+            return int(numel())
         return len(value)
-    except TypeError:
+    except Exception:
         return 0
 
 
 def req_brief(req: Any) -> str:
     if req is None:
         return ""
-    rid = getattr(req, "rid", "")
-    extend_len = getattr(req, "extend_input_len", None)
-    host_hit = getattr(req, "host_hit_length", None)
-    prefix_len = _seq_len(getattr(req, "prefix_indices", None))
-    fill_len = _seq_len(getattr(req, "fill_ids", None))
-    return (
-        f"rid={rid} extend={extend_len} host_hit={host_hit} "
-        f"prefix={prefix_len} fill={fill_len}"
+    try:
+        rid = getattr(req, "rid", "")
+        extend_len = getattr(req, "extend_input_len", None)
+        host_hit = getattr(req, "host_hit_length", None)
+        prefix_len = _seq_len(getattr(req, "prefix_indices", None))
+        fill_len = _seq_len(getattr(req, "fill_ids", None))
+        return (
+            f"rid={rid} extend={extend_len} host_hit={host_hit} "
+            f"prefix={prefix_len} fill={fill_len}"
+        )
+    except Exception as exc:
+        return f"rid={getattr(req, 'rid', '?')} brief_error={exc!r}"
+
+
+def is_hicache_idle(snapshot: dict[str, Any]) -> bool:
+    return all(
+        snapshot.get(k, 0) == 0
+        for k in (
+            "ongoing_write_through",
+            "ongoing_load_back",
+            "ongoing_prefetch",
+            "ongoing_backup",
+            "ack_write_q",
+            "ack_load_q",
+            "write_q",
+            "load_q",
+        )
     )
 
 

@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_debug import (
+    is_hicache_idle,
     log_event_sync,
     log_hicache,
     log_hicache_block,
@@ -62,6 +63,7 @@ from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.server_args import ServerArgs
 
@@ -1137,11 +1139,18 @@ class HiRadixCache(RadixCache):
         self.writing_check()
 
     def check_hicache_events(self):
-        with log_hicache_block(
-            "check_hicache_events",
-            cache=self,
-            **snapshot_hicache_state(self),
-        ):
+        snap = snapshot_hicache_state(self)
+        if is_hicache_idle(snap):
+            self.writing_check()
+            self.loading_check()
+            if self.enable_storage:
+                self.drain_storage_control_queues()
+            if self.enable_storage_metrics:
+                self.storage_metrics_collector.log_storage_metrics(
+                    self.cache_controller.storage_backend.get_stats()
+                )
+            return
+        with log_hicache_block("check_hicache_events", cache=self, **snap):
             self.writing_check()
             self.loading_check()
             if self.enable_storage:
@@ -1585,6 +1594,26 @@ class HiRadixCache(RadixCache):
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
         return InsertResult(prefix_len=total_prefix_length)
+
+    def cache_unfinished_req(self, req: "Req", chunked=False):
+        from sglang.srt.mem_cache.hicache_debug import _seq_len
+
+        log_hicache(
+            "cache_unfinished_req",
+            cache=self,
+            req_id=req.rid,
+            chunked=chunked,
+            fill_len=_seq_len(getattr(req, "fill_ids", None)),
+            **snapshot_hicache_state(self),
+        )
+        with log_hicache_block(
+            "cache_unfinished_req",
+            cache=self,
+            req_id=req.rid,
+            chunked=chunked,
+            slow_ms=100.0,
+        ):
+            super().cache_unfinished_req(req, chunked=chunked)
 
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request

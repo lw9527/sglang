@@ -189,7 +189,9 @@ from sglang.srt.managers.utils import GenerationBatchResult, validate_input_leng
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.hicache_debug import (
+    is_hicache_idle,
     log_hicache,
+    log_hicache_block,
     req_brief,
     snapshot_hicache_state,
 )
@@ -2444,13 +2446,21 @@ class Scheduler(
                 self._add_request_to_queue(req)
 
         if self.enable_hierarchical_cache:
+            snap = snapshot_hicache_state(self.tree_cache)
+            idle = (
+                len(self.waiting_queue) == 0
+                and len(self.running_batch.reqs) == 0
+                and self.chunked_req is None
+                and is_hicache_idle(snap)
+            )
             log_hicache(
                 "scheduler_check_hicache_events",
                 cache=self.tree_cache,
                 waiting=len(self.waiting_queue),
                 running=len(self.running_batch.reqs),
                 chunked=1 if self.chunked_req is not None else 0,
-                **snapshot_hicache_state(self.tree_cache),
+                throttle_key="scheduler_idle_hicache" if idle else "",
+                **snap,
             )
             self.tree_cache.check_hicache_events()
 
@@ -2571,7 +2581,19 @@ class Scheduler(
                     req.rid
                 )
 
-            req.init_next_round_input(self.tree_cache)
+            log_hicache(
+                "scheduler_init_next_round_input",
+                cache=self.tree_cache,
+                req_id=req.rid,
+                info=req_brief(req),
+            )
+            with log_hicache_block(
+                "init_next_round_input",
+                cache=self.tree_cache,
+                req_id=req.rid,
+                slow_ms=50.0,
+            ):
+                req.init_next_round_input(self.tree_cache)
             log_hicache(
                 "scheduler_prefill_try_add",
                 cache=self.tree_cache,
@@ -2809,6 +2831,28 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+
+        if self.enable_hierarchical_cache and batch.forward_mode == ForwardMode.EXTEND:
+            total_extend = sum(getattr(r, "extend_input_len", 0) for r in batch.reqs)
+            with log_hicache_block(
+                "run_batch_extend",
+                cache=self.tree_cache,
+                batch_size=len(batch.reqs),
+                total_extend=total_extend,
+                hicache_consumer=getattr(batch, "hicache_consumer_index", -1),
+                rids=[r.rid for r in batch.reqs],
+                **snapshot_hicache_state(self.tree_cache),
+                slow_ms=100.0,
+            ):
+                return self._run_batch_impl(batch, pp_proxy_tensors)
+        return self._run_batch_impl(batch, pp_proxy_tensors)
+
+    def _run_batch_impl(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+        """Run a batch (internal)."""
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)

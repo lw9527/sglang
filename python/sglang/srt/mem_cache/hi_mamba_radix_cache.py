@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_debug import (
+    is_hicache_idle,
     log_event_sync,
     log_hicache,
     log_hicache_block,
@@ -526,14 +527,20 @@ class HiMambaRadixCache(MambaRadixCache):
         self.writing_check()
 
     def check_hicache_events(self):
-        with log_hicache_block(
-            "check_hicache_events",
-            cache=self,
-            **snapshot_hicache_state(self),
-        ):
+        snap = snapshot_hicache_state(self)
+        if is_hicache_idle(snap):
             self.writing_check()
             self.loading_check()
-
+            if self.enable_storage:
+                self.drain_storage_control_queues()
+            if self.enable_storage_metrics:
+                self.storage_metrics_collector.log_storage_metrics(
+                    self.cache_controller.storage_backend.get_stats()
+                )
+            return
+        with log_hicache_block("check_hicache_events", cache=self, **snap):
+            self.writing_check()
+            self.loading_check()
             if self.enable_storage:
                 self.drain_storage_control_queues()
             if self.enable_storage_metrics:
