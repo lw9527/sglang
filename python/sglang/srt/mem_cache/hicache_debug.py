@@ -107,7 +107,7 @@ def snapshot_hicache_state(cache: Any) -> dict[str, Any]:
         "ongoing_backup": len(getattr(cache, "ongoing_backup", {}) or {}),
     }
     if cc is not None:
-        out["prefetch_revoke_q"] = cc.prefetch_revoke_queue.qsize()
+        # out["prefetch_revoke_q"] = cc.prefetch_revoke_queue.qsize()
         out["ack_write_q"] = len(getattr(cc, "ack_write_queue", []) or [])
         out["ack_load_q"] = len(getattr(cc, "ack_load_queue", []) or [])
         out["write_q"] = len(getattr(cc, "write_queue", []) or [])
