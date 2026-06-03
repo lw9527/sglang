@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -162,6 +163,8 @@ class HiRadixCache(RadixCache):
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
+        # write_through: defer host backup until insert() finishes
+        self.deferred_write_through_nodes: List[TreeNode] = []
         # record the node segments with ongoing load back
         self.ongoing_load_back = {}
         # record the ongoing prefetch requests
@@ -600,6 +603,7 @@ class HiRadixCache(RadixCache):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
+        self.deferred_write_through_nodes.clear()
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -707,10 +711,23 @@ class HiRadixCache(RadixCache):
 
         if not node.backuped:
             if node.hit_count >= self.write_through_threshold:
-                # write to host if the node is not backuped
+                if self.cache_controller.write_policy == "write_through":
+                    # Batch until insert() returns to avoid blocking the scheduler
+                    # in writing_check() when many pages are inserted at once.
+                    self.deferred_write_through_nodes.append(node)
+                else:
+                    self.write_backup(node)
+
+    def _flush_deferred_write_through(self) -> None:
+        if not self.deferred_write_through_nodes:
+            return
+        nodes = self.deferred_write_through_nodes
+        self.deferred_write_through_nodes = []
+        for node in nodes:
+            if not node.backuped:
                 self.write_backup(node)
 
-    def writing_check(self, write_back=False):
+    def writing_check(self, write_back=False, max_acks: Optional[int] = None):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
@@ -743,7 +760,9 @@ class HiRadixCache(RadixCache):
             )
 
         finish_count = int(queue_size.item())
-        while finish_count > 0:
+        sync_acks = 0
+        ack_limit_hit = False
+        while finish_count > 0 and not ack_limit_hit:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
@@ -751,6 +770,10 @@ class HiRadixCache(RadixCache):
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
+                sync_acks += 1
+                if max_acks is not None and sync_acks >= max_acks:
+                    ack_limit_hit = True
+                    break
             finish_count -= 1
 
     def loading_check(self):
@@ -1036,10 +1059,26 @@ class HiRadixCache(RadixCache):
         return self.cache_controller.start_loading()
 
     def flush_write_through_acks(self) -> None:
-        self.writing_check()
+        self._flush_deferred_write_through()
+        for _ in range(1024):
+            if not self.deferred_write_through_nodes and not self.ongoing_write_through:
+                break
+            if self.deferred_write_through_nodes:
+                self._flush_deferred_write_through()
+            prev = len(self.ongoing_write_through)
+            self.writing_check(max_acks=None)
+            if len(self.ongoing_write_through) == prev:
+                break
+
+    def _write_check_max_acks(self) -> Optional[int]:
+        limit = envs.SGLANG_HICACHE_WRITE_CHECK_MAX_ACKS.get()
+        if limit is None or limit <= 0:
+            return None
+        return int(limit)
 
     def check_hicache_events(self):
-        self.writing_check()
+        self._flush_deferred_write_through()
+        self.writing_check(max_acks=self._write_check_max_acks())
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
@@ -1468,6 +1507,8 @@ class HiRadixCache(RadixCache):
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
+        if self.cache_controller.write_policy == "write_through" and not chunked:
+            self._flush_deferred_write_through()
         return InsertResult(prefix_len=total_prefix_length)
 
     def release_aborted_request(self, rid: str):

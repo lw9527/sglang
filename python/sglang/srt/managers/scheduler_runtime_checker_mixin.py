@@ -544,6 +544,9 @@ class SchedulerRuntimeCheckerMixin:
 
     def on_idle(self: Scheduler):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        # Reply to deferred /health probes even when chunked prefill or HiCache
+        # work keeps is_fully_idle() false.
+        self.maybe_send_health_check_signal()
         if not self.is_fully_idle():
             return
 
