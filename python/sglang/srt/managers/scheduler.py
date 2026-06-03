@@ -1712,6 +1712,9 @@ class Scheduler(
         self._check_pending_flush()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+        # Reply immediately while run_batch is in flight; do not wait for
+        # process_batch_result (which may be blocked on write_through / KV xfer).
+        self.maybe_send_health_check_signal()
 
     def init_req_max_new_tokens(self, req):
         req.sampling_params.max_new_tokens = min(

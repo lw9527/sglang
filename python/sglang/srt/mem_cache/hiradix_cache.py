@@ -653,7 +653,18 @@ class HiRadixCache(RadixCache):
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
 
+    def _skip_write_through_host_backup(self) -> bool:
+        """PD prefill sends KV to decode; synchronous L1->L2 backup blocks the scheduler."""
+        if self.cache_controller.write_policy != "write_through":
+            return False
+        from sglang.srt.server_args import get_global_server_args
+
+        return get_global_server_args().disaggregation_mode == "prefill"
+
     def write_backup(self, node: TreeNode, write_back=False) -> int:
+        if not write_back and self._skip_write_through_host_backup():
+            return 0
+
         # Backup invariant (for write-through mode): backed-up nodes must form a
         # contiguous prefix from root — no gaps.  Skip if parent isn't backed
         # up yet;
@@ -707,6 +718,8 @@ class HiRadixCache(RadixCache):
         # skip the hit count update for chunked requests
         if self.cache_controller.write_policy == "write_back" or chunked:
             return
+        if self._skip_write_through_host_backup():
+            return
         node.hit_count += 1
 
         if not node.backuped:
@@ -719,6 +732,9 @@ class HiRadixCache(RadixCache):
                     self.write_backup(node)
 
     def _flush_deferred_write_through(self) -> None:
+        if self._skip_write_through_host_backup():
+            self.deferred_write_through_nodes.clear()
+            return
         if not self.deferred_write_through_nodes:
             return
         nodes = self.deferred_write_through_nodes
@@ -1077,7 +1093,8 @@ class HiRadixCache(RadixCache):
         return int(limit)
 
     def check_hicache_events(self):
-        self._flush_deferred_write_through()
+        # Do not flush deferred write_through here — insert() already batches
+        # host backup; flushing in the scheduling hot path blocks run_batch.
         self.writing_check(max_acks=self._write_check_max_acks())
         self.loading_check()
         if self.enable_storage:
