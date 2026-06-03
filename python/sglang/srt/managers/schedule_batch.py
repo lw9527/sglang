@@ -1041,11 +1041,29 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def _ensure_token_id_arrays(self) -> None:
+        """Normalize token-id fields to array.array('q') before concatenation."""
+        if not isinstance(self.origin_input_ids, array):
+            logger.warning(
+                "origin_input_ids is %s (expected array), normalizing (rid=%s)",
+                type(self.origin_input_ids).__name__,
+                self.rid,
+            )
+            self.origin_input_ids = array("q", self.origin_input_ids)
+        if not isinstance(self.output_ids, array):
+            logger.warning(
+                "output_ids is %s (expected array), normalizing (rid=%s)",
+                type(self.output_ids).__name__,
+                self.rid,
+            )
+            self.output_ids = array("q", self.output_ids)
+
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
     ):
+        self._ensure_token_id_arrays()
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
