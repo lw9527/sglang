@@ -34,6 +34,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_tp_rank,
@@ -44,6 +45,14 @@ from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
+
+
+def _trace_hicache_write(stage: str, **fields) -> None:
+    if not envs.SGLANG_HICACHE_WRITE_THROUGH_TRACE.get():
+        return
+    detail = " ".join(f"{k}={v}" for k, v in fields.items())
+    logger.info("[HiCache write_through] %s %s", stage, detail)
+
 
 device_module = get_device_module()
 
@@ -669,13 +678,30 @@ class HiCacheController:
         """
         Back up KV caches from device memory to host memory.
         """
+        _trace_hicache_write(
+            "controller_write_enter",
+            node_id=node_id,
+            tokens=len(device_indices),
+            io_backend=self.io_backend,
+        )
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
+            _trace_hicache_write("controller_write_alloc_none", node_id=node_id)
             return None
+        _trace_hicache_write(
+            "controller_write_alloc_ok",
+            node_id=node_id,
+            host_tokens=len(host_indices),
+        )
         self.write_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
         self.start_writing()
+        _trace_hicache_write(
+            "controller_write_return",
+            node_id=node_id,
+            ack_queue=len(self.ack_write_queue),
+        )
         return host_indices
 
     def start_writing(self) -> None:
@@ -683,13 +709,26 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
+        _trace_hicache_write(
+            "start_writing_merge",
+            node_ids=op.node_ids,
+            tokens=len(op.device_indices),
+        )
         host_indices, device_indices = self.move_indices(op)
+        _trace_hicache_write(
+            "start_writing_move_indices_done",
+            host_on_device=(
+                host_indices.is_cuda if hasattr(host_indices, "is_cuda") else "n/a"
+            ),
+            device_on_cpu=device_indices.device.type == "cpu",
+        )
         self.write_queue.clear()
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
 
         start_event.record()
+        _trace_hicache_write("start_writing_before_d2h", io_backend=self.io_backend)
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
             self.mem_pool_host.backup_from_device_all_layer(
@@ -703,6 +742,12 @@ class HiCacheController:
                 host_indices.record_stream(self.write_stream)
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_stream)
+
+        _trace_hicache_write(
+            "start_writing_after_d2h",
+            node_ids=op.node_ids,
+            ack_queue=len(self.ack_write_queue),
+        )
 
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
