@@ -292,6 +292,8 @@ class Envs:
     # Max write-through DMA acks per check_hicache_events(); avoids scheduler stalls.
     # Set to 0 for no limit.
     SGLANG_HICACHE_WRITE_CHECK_MAX_ACKS = EnvInt(8)
+    # Log write_through stages (defer/flush/D2H ack) to locate scheduler stalls.
+    SGLANG_HICACHE_WRITE_THROUGH_TRACE = EnvBool(True)
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)
