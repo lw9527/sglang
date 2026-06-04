@@ -913,7 +913,12 @@ class ChatCompletionRequest(BaseModel):
         )
 
         if tool_call_constraint and has_existing_constraints:
-            logger.warning("Constrained decoding is not compatible with tool calls.")
+            logger.warning(
+                "[tool_call] skipped tool_call_constraint because request already has "
+                "output constraints (tool_choice=%s, tool_call_constraint=%s)",
+                self.tool_choice,
+                tool_call_constraint[0],
+            )
         elif tool_call_constraint:
             constraint_type, constraint_value = tool_call_constraint
             if constraint_type == "structural_tag":
@@ -926,6 +931,20 @@ class ChatCompletionRequest(BaseModel):
                 )
             else:
                 sampling_params[constraint_type] = constraint_value
+            preview = sampling_params.get(constraint_type, "")
+            if isinstance(preview, str) and len(preview) > 500:
+                preview = preview[:500] + "...(truncated)"
+            logger.info(
+                "[tool_call] applied sampling constraint type=%s tool_choice=%s preview=%s",
+                constraint_type,
+                self.tool_choice,
+                preview,
+            )
+        elif self.tools and self.tool_choice not in (None, "none"):
+            logger.info(
+                "[tool_call] no sampling constraint applied (tool_choice=%s)",
+                self.tool_choice,
+            )
 
         return sampling_params
 

@@ -234,6 +234,7 @@ class FunctionCallParser:
             any(tool.function.strict for tool in self.tools)
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
+        detector_name = type(self.detector).__name__
 
         # Highest priority: model-native structural_tag when available.
         try:
@@ -244,6 +245,13 @@ class FunctionCallParser:
                     tool_choice=tool_choice,
                 )
                 if structural_tag is not None:
+                    logger.info(
+                        "[tool_call] structure constraint: native structural_tag "
+                        "(detector=%s, tool_choice=%s, thinking_mode=%s)",
+                        detector_name,
+                        tool_choice,
+                        thinking_mode,
+                    )
                     return ("structural_tag", structural_tag)
 
                 # Fallback to legacy structural tag if model-native tag is not supported.
@@ -253,13 +261,44 @@ class FunctionCallParser:
                     # strict=True, per OpenAI protocol semantics.
                     # For "auto": only constrain when strict is enabled.
                     tag = self.get_legacy_structural_tag(at_least_one=is_required)
+                    logger.info(
+                        "[tool_call] structure constraint: legacy structural_tag "
+                        "(detector=%s, tool_choice=%s, at_least_one=%s)",
+                        detector_name,
+                        tool_choice,
+                        is_required,
+                    )
                     return ("structural_tag", tag)
 
             if tool_choice == "required" or isinstance(tool_choice, ToolChoice):
                 json_schema = get_json_schema_constraint(
                     self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
                 )
+                logger.info(
+                    "[tool_call] structure constraint: json_schema fallback "
+                    "(detector=%s, supports_structural_tag=%s, tool_choice=%s, "
+                    "parallel_tool_calls=%s, schema=%s)",
+                    detector_name,
+                    self.detector.supports_structural_tag(),
+                    tool_choice,
+                    parallel_tool_calls,
+                    json_schema,
+                )
                 return ("json_schema", json_schema)
+
+            logger.info(
+                "[tool_call] structure constraint: none "
+                "(detector=%s, tool_choice=%s, is_required=%s, should_constrain_auto=%s)",
+                detector_name,
+                tool_choice,
+                is_required,
+                should_constrain_auto,
+            )
         except Exception as e:
-            logger.error(f"Error getting structure constraint: {e}")
+            logger.error(
+                "[tool_call] structure constraint error (detector=%s, tool_choice=%s): %s",
+                detector_name,
+                tool_choice,
+                e,
+            )
             return None

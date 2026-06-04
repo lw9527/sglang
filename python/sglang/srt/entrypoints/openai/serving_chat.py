@@ -593,6 +593,23 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
+                logger.info(
+                    "[tool_call] serving_chat json_schema fallback (parser=%s, "
+                    "tool_choice=%s, schema=%s)",
+                    self.tool_call_parser,
+                    request.tool_choice,
+                    json_schema,
+                )
+
+        if request.tools and request.tool_choice != "none":
+            logger.info(
+                "[tool_call] _process_messages tool_choice=%s parser=%s "
+                "constraint=%s xgrammar_reasoning=%s",
+                request.tool_choice,
+                self.tool_call_parser,
+                tool_call_constraint[0] if tool_call_constraint else None,
+                xgrammar_reasoning,
+            )
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
@@ -1367,16 +1384,30 @@ class OpenAIServingChat(OpenAIServingBase):
         """Process tool calls in the response"""
 
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
+        text_preview = text[:300] if text else ""
 
         # Try model-specific parser when output is in native format.
         # For required/named: only use parser when structural_tag was used
         # as constraint (mirrors the streaming path). For auto: always try.
         if self.tool_call_parser:
             parser = FunctionCallParser(tools, self.tool_call_parser)
-            should_try_parser = (
-                not is_required or parser.detector.supports_structural_tag()
+            supports_structural_tag = parser.detector.supports_structural_tag()
+            has_tool_call = parser.has_tool_call(text)
+            should_try_parser = not is_required or supports_structural_tag
+            logger.info(
+                "[tool_call] _process_tool_calls parser=%s tool_choice=%s "
+                "is_required=%s supports_structural_tag=%s should_try_parser=%s "
+                "has_tool_call=%s finish_reason=%s text_preview=%r",
+                self.tool_call_parser,
+                tool_choice,
+                is_required,
+                supports_structural_tag,
+                should_try_parser,
+                has_tool_call,
+                finish_reason,
+                text_preview,
             )
-            if should_try_parser and parser.has_tool_call(text):
+            if should_try_parser and has_tool_call:
                 original_finish_type = finish_reason["type"]
                 if finish_reason["type"] == "stop":
                     finish_reason["type"] = "tool_calls"
@@ -1398,11 +1429,25 @@ class OpenAIServingChat(OpenAIServingBase):
                                 ),
                             )
                         )
+                    logger.info(
+                        "[tool_call] native parser succeeded: %d tool call(s)",
+                        len(tool_calls),
+                    )
                     return ToolCallProcessingResult(tool_calls, text, finish_reason)
                 except Exception as e:
-                    logger.error(f"Tool call parsing error: {e}")
+                    logger.error(
+                        "[tool_call] native parser failed (tool_choice=%s): %s",
+                        tool_choice,
+                        e,
+                    )
                     finish_reason["type"] = original_finish_type
                     return ToolCallProcessingResult(None, text, finish_reason)
+            if is_required and not should_try_parser:
+                logger.info(
+                    "[tool_call] skipping native parser for required tool_choice "
+                    "(parser=%s does not support structural_tag; expecting JSON array)",
+                    self.tool_call_parser,
+                )
 
         # json_schema constraint → JSON array output for required/named
         if is_required:
@@ -1434,12 +1479,28 @@ class OpenAIServingChat(OpenAIServingBase):
                             ),
                         )
                     )
+                logger.info(
+                    "[tool_call] json_schema path succeeded: %d tool call(s)",
+                    len(tool_calls),
+                )
                 return ToolCallProcessingResult(tool_calls, "", finish_reason)
             except Exception as e:
-                logger.error(f"Tool call parsing error: {e}")
+                logger.error(
+                    "[tool_call] json_schema path failed (tool_choice=%s, "
+                    "finish_reason=%s, text_preview=%r): %s",
+                    tool_choice,
+                    finish_reason,
+                    text_preview,
+                    e,
+                )
                 finish_reason["type"] = original_finish_type
                 return ToolCallProcessingResult(None, text, finish_reason)
 
+        logger.info(
+            "[tool_call] no tool_calls extracted (tool_choice=%s, parser=%s)",
+            tool_choice,
+            self.tool_call_parser,
+        )
         return ToolCallProcessingResult(None, text, finish_reason)
 
     def _process_streaming_logprobs(
@@ -1624,6 +1685,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     parser_dict[index] = probe
                 else:
                     parser_dict[index] = JsonArrayParser()
+                logger.info(
+                    "[tool_call] stream parser init index=%s tool_choice=%s parser=%s "
+                    "(use_native_parser=%s)",
+                    index,
+                    request.tool_choice,
+                    self.tool_call_parser,
+                    use_native_parser,
+                )
             else:
                 parser_dict[index] = FunctionCallParser(
                     tools=request.tools,
