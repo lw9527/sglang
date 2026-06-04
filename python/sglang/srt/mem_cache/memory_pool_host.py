@@ -76,6 +76,13 @@ def _trace_hicache_backup(stage: str, **fields) -> None:
 
 if _is_npu:
 
+    def _describe_npu_kv_buffer(buf) -> str:
+        if isinstance(buf, list):
+            if not buf:
+                return "list[0]"
+            return f"list[{len(buf)}] elem0_shape={tuple(buf[0].shape)} elem0_device={buf[0].device}"
+        return f"shape={tuple(buf.shape)} device={buf.device}"
+
     def _npu_d2h_dim_exchange(
         *,
         pool: str,
@@ -98,16 +105,14 @@ if _is_npu:
             layer_num=layer_num,
             host_tokens=len(host_indices),
             device_tokens=len(device_indices),
-            device_k_shape=tuple(device_k.shape),
-            host_k_shape=tuple(host_k.shape),
-            device_v_shape=tuple(device_v.shape),
-            host_v_shape=tuple(host_v.shape),
-            device_k_device=str(device_k.device),
-            host_k_device=str(host_k.device),
+            device_k=_describe_npu_kv_buffer(device_k),
+            host_k=_describe_npu_kv_buffer(host_k),
+            device_v=_describe_npu_kv_buffer(device_v),
+            host_v=_describe_npu_kv_buffer(host_v),
         )
         if device_index_k is not None:
-            ctx["device_index_k_shape"] = tuple(device_index_k.shape)
-            ctx["host_index_k_shape"] = tuple(host_index_k.shape)
+            ctx["device_index_k"] = _describe_npu_kv_buffer(device_index_k)
+            ctx["host_index_k"] = _describe_npu_kv_buffer(host_index_k)
         _trace_hicache_backup("backup_before_transfer_kv_dim_exchange", **ctx)
         kwargs = dict(
             device_indices=device_indices,
