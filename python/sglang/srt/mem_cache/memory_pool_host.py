@@ -83,6 +83,77 @@ if _is_npu:
             return f"list[{len(buf)}] elem0_shape={tuple(buf[0].shape)} elem0_device={buf[0].device}"
         return f"shape={tuple(buf.shape)} device={buf.device}"
 
+    def _stack_npu_kv_buffer(buf):
+        """Stack per-layer list buffers into 5D tensor for transfer_kv_dim_exchange."""
+        if buf is None:
+            return None
+        if isinstance(buf, list):
+            if not buf:
+                raise ValueError("NPU KV buffer list must not be empty")
+            return torch.stack(buf, dim=0)
+        return buf
+
+    def _npu_kv_dim_exchange(
+        *,
+        device_indices,
+        host_indices,
+        device_k,
+        host_k,
+        device_v,
+        host_v,
+        page_size: int,
+        direction: TransferDirection,
+        device_index_k=None,
+        host_index_k=None,
+        trace_pool: Optional[str] = None,
+        trace_layout: Optional[str] = None,
+        layer_num: Optional[int] = None,
+    ) -> None:
+        device_k = _stack_npu_kv_buffer(device_k)
+        device_v = _stack_npu_kv_buffer(device_v)
+        if device_index_k is not None:
+            device_index_k = _stack_npu_kv_buffer(device_index_k)
+
+        if trace_pool is not None:
+            ctx = dict(
+                pool=trace_pool,
+                layout=trace_layout,
+                page_size=page_size,
+                layer_num=layer_num,
+                host_tokens=len(host_indices),
+                device_tokens=len(device_indices),
+                device_k=_describe_npu_kv_buffer(device_k),
+                host_k=_describe_npu_kv_buffer(host_k),
+                device_v=_describe_npu_kv_buffer(device_v),
+                host_v=_describe_npu_kv_buffer(host_v),
+            )
+            if device_index_k is not None:
+                ctx["device_index_k"] = _describe_npu_kv_buffer(device_index_k)
+                ctx["host_index_k"] = _describe_npu_kv_buffer(host_index_k)
+            _trace_hicache_backup("backup_before_transfer_kv_dim_exchange", **ctx)
+
+        kwargs = dict(
+            device_indices=device_indices,
+            host_indices=host_indices,
+            device_k=device_k,
+            host_k=host_k,
+            device_v=device_v,
+            host_v=host_v,
+            page_size=page_size,
+            direction=direction,
+        )
+        if device_index_k is not None:
+            kwargs["device_index_k"] = device_index_k
+            kwargs["host_index_k"] = host_index_k
+        transfer_kv_dim_exchange(**kwargs)
+
+        if trace_pool is not None:
+            _trace_hicache_backup(
+                "backup_after_transfer_kv_dim_exchange",
+                pool=trace_pool,
+                layout=trace_layout,
+            )
+
     def _npu_d2h_dim_exchange(
         *,
         pool: str,
@@ -98,23 +169,7 @@ if _is_npu:
         device_index_k=None,
         host_index_k=None,
     ) -> None:
-        ctx = dict(
-            pool=pool,
-            layout=layout,
-            page_size=page_size,
-            layer_num=layer_num,
-            host_tokens=len(host_indices),
-            device_tokens=len(device_indices),
-            device_k=_describe_npu_kv_buffer(device_k),
-            host_k=_describe_npu_kv_buffer(host_k),
-            device_v=_describe_npu_kv_buffer(device_v),
-            host_v=_describe_npu_kv_buffer(host_v),
-        )
-        if device_index_k is not None:
-            ctx["device_index_k"] = _describe_npu_kv_buffer(device_index_k)
-            ctx["host_index_k"] = _describe_npu_kv_buffer(host_index_k)
-        _trace_hicache_backup("backup_before_transfer_kv_dim_exchange", **ctx)
-        kwargs = dict(
+        _npu_kv_dim_exchange(
             device_indices=device_indices,
             host_indices=host_indices,
             device_k=device_k,
@@ -123,13 +178,11 @@ if _is_npu:
             host_v=host_v,
             page_size=page_size,
             direction=TransferDirection.D2H,
-        )
-        if device_index_k is not None:
-            kwargs["device_index_k"] = device_index_k
-            kwargs["host_index_k"] = host_index_k
-        transfer_kv_dim_exchange(**kwargs)
-        _trace_hicache_backup(
-            "backup_after_transfer_kv_dim_exchange", pool=pool, layout=layout
+            device_index_k=device_index_k,
+            host_index_k=host_index_k,
+            trace_pool=pool,
+            trace_layout=layout,
+            layer_num=layer_num,
         )
 
 
@@ -564,7 +617,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             if self.layout == "page_first_direct":
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
                 if layer_id == 0:
-                    transfer_kv_dim_exchange(
+                    _npu_kv_dim_exchange(
                         device_indices=device_indices,
                         host_indices=host_indices,
                         device_k=device_pool.k_buffer,
@@ -1074,7 +1127,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             if self.layout == "page_first_kv_split":
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
                 if layer_id == 0:
-                    transfer_kv_dim_exchange(
+                    _npu_kv_dim_exchange(
                         device_indices=device_indices,
                         host_indices=host_indices,
                         device_k=device_pool.k_buffer,
