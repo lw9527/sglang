@@ -4,12 +4,27 @@ import torch
 import torch_npu
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.hardware_backend.npu.alignment import ALIGNMENT_BLOCK_2M
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     get_tensor_size_bytes,
 )
 from sglang.srt.utils import get_bool_env_var
+
+
+def _npu_padded_page_count(
+    num_pages: int, page_size: int, head_dim: int, dtype: torch.dtype
+) -> int:
+    """Pad per-layer KV slab so layer strides are 2 MiB-aligned (PD IPC + dim_exchange)."""
+    elem_size = torch.tensor([], dtype=dtype).element_size()
+    layer_bytes = num_pages * page_size * 1 * head_dim * elem_size
+    padded_layer_bytes = (
+        (layer_bytes + ALIGNMENT_BLOCK_2M - 1) // ALIGNMENT_BLOCK_2M
+    ) * ALIGNMENT_BLOCK_2M
+    page_bytes = page_size * 1 * head_dim * elem_size
+    return padded_layer_bytes // page_bytes
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -247,57 +262,84 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # 2 MiB aligned via base_addr_aligned_kb=2048.
-            num_pages = self.size // self.page_size + 1
-
-            self.k_buffer = [
-                torch.zeros(
-                    (num_pages, self.page_size, 1, self.kv_lora_rank),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(layer_num)
-            ]
-            self.v_buffer = [
-                torch.zeros(
-                    (num_pages, self.page_size, 1, self.qk_rope_head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(layer_num)
-            ]
+            # 5D layout (layer, page, page_size, 1, dim) for transfer_kv_dim_exchange;
+            # pad the page dim so each layer base is 2 MiB-aligned for PD IPC.
+            self._num_pages = self.size // self.page_size + 1
+            k_padded_pages = _npu_padded_page_count(
+                self._num_pages, self.page_size, self.kv_lora_rank, self.store_dtype
+            )
+            v_padded_pages = _npu_padded_page_count(
+                self._num_pages,
+                self.page_size,
+                self.qk_rope_head_dim,
+                self.store_dtype,
+            )
+            self.k_buffer = torch.zeros(
+                (
+                    self.layer_num,
+                    k_padded_pages,
+                    self.page_size,
+                    1,
+                    self.kv_lora_rank,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            self.v_buffer = torch.zeros(
+                (
+                    self.layer_num,
+                    v_padded_pages,
+                    self.page_size,
+                    1,
+                    self.qk_rope_head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
-                self.index_k_buffer = [
-                    torch.zeros(
-                        (num_pages, self.page_size, 1, self.index_head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(layer_num)
-                ]
+                ik_padded_pages = _npu_padded_page_count(
+                    self._num_pages,
+                    self.page_size,
+                    self.index_head_dim,
+                    self.store_dtype,
+                )
+                self.index_k_buffer = torch.zeros(
+                    (
+                        self.layer_num,
+                        ik_padded_pages,
+                        self.page_size,
+                        1,
+                        self.index_head_dim,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
 
         self._finalize_allocation_log(size)
+
+    def _kv_layer(self, buf: torch.Tensor, local_layer_id: int) -> torch.Tensor:
+        """Logical KV pages only; trailing padding is for 2 MiB layer stride / HiCache."""
+        return buf[local_layer_id, : self._num_pages]
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
         assert hasattr(self, "v_buffer")
-        kv_size_bytes = 0
-        for k_cache in self.k_buffer:
-            kv_size_bytes += get_tensor_size_bytes(k_cache)
-        for v_cache in self.v_buffer:
-            kv_size_bytes += get_tensor_size_bytes(v_cache)
+        kv_size_bytes = get_tensor_size_bytes(self.k_buffer) + get_tensor_size_bytes(
+            self.v_buffer
+        )
         if self.index_head_dim is not None:
             assert hasattr(self, "index_k_buffer")
-            for index_k_cache in self.index_k_buffer:
-                kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+            kv_size_bytes += get_tensor_size_bytes(self.index_k_buffer)
         return kv_size_bytes
 
     def get_kv_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        local_id = layer_id - self.start_layer
         return (
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
+            self._kv_layer(self.k_buffer, local_id),
+            self._kv_layer(self.v_buffer, local_id),
         )
 
     def get_state_buf_infos(self):
@@ -309,41 +351,50 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         # leave the underlying ADXL/HIXL engine in an inconsistent state,
         # surfacing later as connect status 503900). This method is kept
         # for non-PD callers that want to introspect the indexer cache.
-        data_ptrs = [self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)]
-        data_lens = [self.index_k_buffer[i].nbytes for i in range(self.layer_num)]
-        item_lens = [self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)]
+        data_ptrs = [
+            self._kv_layer(self.index_k_buffer, i).data_ptr()
+            for i in range(self.layer_num)
+        ]
+        data_lens = [
+            self._kv_layer(self.index_k_buffer, i).nbytes for i in range(self.layer_num)
+        ]
+        item_lens = [
+            self._kv_layer(self.index_k_buffer, i)[0].nbytes
+            for i in range(self.layer_num)
+        ]
         return data_ptrs, data_lens, item_lens
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        buf = self._kv_layer(self.k_buffer, layer_id - self.start_layer)
         if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.k_buffer[layer_id - self.start_layer]
+            return buf.view(self.dtype)
+        return buf
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        buf = self._kv_layer(self.v_buffer, layer_id - self.start_layer)
         if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.v_buffer[layer_id - self.start_layer]
+            return buf.view(self.dtype)
+        return buf
 
     def get_index_k_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        buf = self._kv_layer(self.index_k_buffer, layer_id - self.start_layer)
         if self.store_dtype != self.dtype:
-            return self.index_k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.index_k_buffer[layer_id - self.start_layer]
+            return buf.view(self.dtype)
+        return buf
 
     # for disagg
     def get_contiguous_buf_infos(self):
-        # NPU MLA / NSA layout. Unlike the upstream MLATokenToKVPool which
-        # packs K and V into a single combined kv_buffer per layer, the NPU
-        # variant exposes K and V (and, for NSA, index_k) as INDEPENDENT
-        # per-layer buffers — each with its own 2 MB-aligned base pointer.
+        # NPU MLA / NSA layout. K/V/index_k are 5D tensors (layer, page, ...);
+        # per-layer views share one allocation with 2 MiB-padded layer stride.
         # The returned lists are GROUP-ORDERED:
         #     kv_data_ptrs = [K_0..K_{N-1}, V_0..V_{N-1}, IK_0..IK_{N-1}]
         #     kv_item_lens = [k_il...,      v_il...,      ik_il...      ]
@@ -352,24 +403,27 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         # a single layer-stripe list. See:
         #   - common/conn.py:get_mla_kv_ptrs_with_pp (group-aware PP slicing)
         #   - mooncake/conn.py:_send_kvcache_generic (per-entry item_len)
-        kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)] + [
-            self.v_buffer[i].data_ptr() for i in range(self.layer_num)
-        ]
-        kv_data_lens = [self.k_buffer[i].nbytes for i in range(self.layer_num)] + [
-            self.v_buffer[i].nbytes for i in range(self.layer_num)
-        ]
-        kv_item_lens = [self.k_buffer[i][0].nbytes for i in range(self.layer_num)] + [
-            self.v_buffer[i][0].nbytes for i in range(self.layer_num)
-        ]
+        kv_data_ptrs = [
+            self._kv_layer(self.k_buffer, i).data_ptr() for i in range(self.layer_num)
+        ] + [self._kv_layer(self.v_buffer, i).data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [
+            self._kv_layer(self.k_buffer, i).nbytes for i in range(self.layer_num)
+        ] + [self._kv_layer(self.v_buffer, i).nbytes for i in range(self.layer_num)]
+        kv_item_lens = [
+            self._kv_layer(self.k_buffer, i)[0].nbytes for i in range(self.layer_num)
+        ] + [self._kv_layer(self.v_buffer, i)[0].nbytes for i in range(self.layer_num)]
         if self.index_head_dim is not None:
             kv_data_ptrs += [
-                self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)
+                self._kv_layer(self.index_k_buffer, i).data_ptr()
+                for i in range(self.layer_num)
             ]
             kv_data_lens += [
-                self.index_k_buffer[i].nbytes for i in range(self.layer_num)
+                self._kv_layer(self.index_k_buffer, i).nbytes
+                for i in range(self.layer_num)
             ]
             kv_item_lens += [
-                self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)
+                self._kv_layer(self.index_k_buffer, i)[0].nbytes
+                for i in range(self.layer_num)
             ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
@@ -394,15 +448,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
 
+        local_id = layer_id - self.start_layer
+        k_layer = self._kv_layer(self.k_buffer, local_id)
+        v_layer = self._kv_layer(self.v_buffer, local_id)
+
         torch_npu.npu_scatter_nd_update_(
-            self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
+            k_layer.view(-1, 1, self.kv_lora_rank),
             loc.view(-1, 1),
             cache_k.view(-1, 1, self.kv_lora_rank),
         )
         torch_npu.npu_scatter_nd_update_(
-            self.v_buffer[layer_id - self.start_layer].view(
-                -1, 1, self.qk_rope_head_dim
-            ),
+            v_layer.view(-1, 1, self.qk_rope_head_dim),
             loc.view(-1, 1),
             cache_v.view(-1, 1, self.qk_rope_head_dim),
         )
@@ -420,7 +476,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             index_k = index_k.view(self.store_dtype)
 
         torch_npu.npu_scatter_nd_update_(
-            self.index_k_buffer[layer_id - self.start_layer].view(
+            self._kv_layer(self.index_k_buffer, layer_id - self.start_layer).view(
                 -1, 1, self.index_head_dim
             ),
             loc.view(-1, 1),
@@ -441,10 +497,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         chunk_size = self.cpu_offloading_chunk_size
         has_ik = self.index_head_dim is not None
         for local_layer_id in range(self.layer_num):
-            k_layer = self.k_buffer[local_layer_id].view(-1, 1, self.kv_lora_rank)
-            v_layer = self.v_buffer[local_layer_id].view(-1, 1, self.qk_rope_head_dim)
+            k_layer = self._kv_layer(self.k_buffer, local_layer_id).view(
+                -1, 1, self.kv_lora_rank
+            )
+            v_layer = self._kv_layer(self.v_buffer, local_layer_id).view(
+                -1, 1, self.qk_rope_head_dim
+            )
             ik_layer = (
-                self.index_k_buffer[local_layer_id].view(-1, 1, self.index_head_dim)
+                self._kv_layer(self.index_k_buffer, local_layer_id).view(
+                    -1, 1, self.index_head_dim
+                )
                 if has_ik
                 else None
             )
@@ -467,10 +529,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         chunk_size = self.cpu_offloading_chunk_size
         has_ik = self.index_head_dim is not None
         for local_layer_id in range(self.layer_num):
-            k_layer = self.k_buffer[local_layer_id].view(-1, 1, self.kv_lora_rank)
-            v_layer = self.v_buffer[local_layer_id].view(-1, 1, self.qk_rope_head_dim)
+            k_layer = self._kv_layer(self.k_buffer, local_layer_id).view(
+                -1, 1, self.kv_lora_rank
+            )
+            v_layer = self._kv_layer(self.v_buffer, local_layer_id).view(
+                -1, 1, self.qk_rope_head_dim
+            )
             ik_layer = (
-                self.index_k_buffer[local_layer_id].view(-1, 1, self.index_head_dim)
+                self._kv_layer(self.index_k_buffer, local_layer_id).view(
+                    -1, 1, self.index_head_dim
+                )
                 if has_ik
                 else None
             )
