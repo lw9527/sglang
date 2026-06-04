@@ -739,6 +739,14 @@ class HiCacheController:
                 "start_writing_after_stream_wait",
                 node_ids=op.node_ids,
             )
+            _trace_hicache_write(
+                "start_writing_backup_call",
+                mem_pool_host_type=type(self.mem_pool_host).__name__,
+                mem_pool_host_layout=getattr(self.mem_pool_host, "layout", "n/a"),
+                mem_pool_device_type=type(self.mem_pool_device).__name__,
+                io_backend=self.io_backend,
+                node_ids=op.node_ids,
+            )
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
             )

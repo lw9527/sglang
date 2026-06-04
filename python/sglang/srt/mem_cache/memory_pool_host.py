@@ -64,6 +64,70 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
+
+def _trace_hicache_backup(stage: str, **fields) -> None:
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_HICACHE_WRITE_THROUGH_TRACE.get():
+        return
+    detail = " ".join(f"{k}={v}" for k, v in fields.items())
+    logger.info("[HiCache write_through] %s %s", stage, detail)
+
+
+if _is_npu:
+
+    def _npu_d2h_dim_exchange(
+        *,
+        pool: str,
+        layout: str,
+        page_size: int,
+        layer_num: int,
+        device_indices,
+        host_indices,
+        device_k,
+        host_k,
+        device_v,
+        host_v,
+        device_index_k=None,
+        host_index_k=None,
+    ) -> None:
+        ctx = dict(
+            pool=pool,
+            layout=layout,
+            page_size=page_size,
+            layer_num=layer_num,
+            host_tokens=len(host_indices),
+            device_tokens=len(device_indices),
+            device_k_shape=tuple(device_k.shape),
+            host_k_shape=tuple(host_k.shape),
+            device_v_shape=tuple(device_v.shape),
+            host_v_shape=tuple(host_v.shape),
+            device_k_device=str(device_k.device),
+            host_k_device=str(host_k.device),
+        )
+        if device_index_k is not None:
+            ctx["device_index_k_shape"] = tuple(device_index_k.shape)
+            ctx["host_index_k_shape"] = tuple(host_index_k.shape)
+        _trace_hicache_backup("backup_before_transfer_kv_dim_exchange", **ctx)
+        kwargs = dict(
+            device_indices=device_indices,
+            host_indices=host_indices,
+            device_k=device_k,
+            host_k=host_k,
+            device_v=device_v,
+            host_v=host_v,
+            page_size=page_size,
+            direction=TransferDirection.D2H,
+        )
+        if device_index_k is not None:
+            kwargs["device_index_k"] = device_index_k
+            kwargs["host_index_k"] = host_index_k
+        transfer_kv_dim_exchange(**kwargs)
+        _trace_hicache_backup(
+            "backup_after_transfer_kv_dim_exchange", pool=pool, layout=layout
+        )
+
+
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
@@ -513,6 +577,16 @@ class MHATokenToKVPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        _trace_hicache_backup(
+            "backup_enter",
+            pool="MHA",
+            layout=self.layout,
+            io_backend=io_backend,
+            host_tokens=len(host_indices),
+            device_tokens=len(device_indices),
+            layer_num=self.layer_num,
+            page_size=self.page_size,
+        )
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -602,20 +676,28 @@ class MHATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_direct":
-                transfer_kv_dim_exchange(
+                _npu_d2h_dim_exchange(
+                    pool="MHA",
+                    layout=self.layout,
+                    page_size=self.page_size,
+                    layer_num=self.layer_num,
                     device_indices=device_indices,
                     host_indices=host_indices,
                     device_k=device_pool.k_buffer,
                     host_k=self.k_buffer,
                     device_v=device_pool.v_buffer,
                     host_v=self.v_buffer,
-                    page_size=self.page_size,
-                    direction=TransferDirection.D2H,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
+        _trace_hicache_backup(
+            "backup_exit",
+            pool="MHA",
+            layout=self.layout,
+            io_backend=io_backend,
+        )
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         if self.layout == "layer_first":
@@ -1007,6 +1089,16 @@ class MLATokenToKVPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        _trace_hicache_backup(
+            "backup_enter",
+            pool="MLA",
+            layout=self.layout,
+            io_backend=io_backend,
+            host_tokens=len(host_indices),
+            device_tokens=len(device_indices),
+            layer_num=self.layer_num,
+            page_size=self.page_size,
+        )
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -1072,7 +1164,11 @@ class MLATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_kv_split":
-                transfer_kv_dim_exchange(
+                _npu_d2h_dim_exchange(
+                    pool="MLA",
+                    layout=self.layout,
+                    page_size=self.page_size,
+                    layer_num=self.layer_num,
                     device_indices=device_indices,
                     host_indices=host_indices,
                     device_k=device_pool.k_buffer,
@@ -1081,13 +1177,17 @@ class MLATokenToKVPoolHost(HostKVCache):
                     host_v=self.v_buffer,
                     device_index_k=device_pool.index_k_buffer,
                     host_index_k=self.index_k_buffer,
-                    page_size=self.page_size,
-                    direction=TransferDirection.D2H,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
+        _trace_hicache_backup(
+            "backup_exit",
+            pool="MLA",
+            layout=self.layout,
+            io_backend=io_backend,
+        )
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         if self.layout == "layer_first":
