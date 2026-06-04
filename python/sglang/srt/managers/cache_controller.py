@@ -728,11 +728,24 @@ class HiCacheController:
         finish_event = device_module.Event()
 
         start_event.record()
-        _trace_hicache_write("start_writing_before_d2h", io_backend=self.io_backend)
+        _trace_hicache_write(
+            "start_writing_before_stream_wait",
+            io_backend=self.io_backend,
+            node_ids=op.node_ids,
+        )
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
+            _trace_hicache_write(
+                "start_writing_after_stream_wait",
+                node_ids=op.node_ids,
+            )
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
+            )
+            _trace_hicache_write(
+                "start_writing_after_backup_kernel",
+                node_ids=op.node_ids,
+                io_backend=self.io_backend,
             )
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
