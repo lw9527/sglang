@@ -560,6 +560,9 @@ class OpenAIServingChat(OpenAIServingBase):
         xgrammar_reasoning = thinking_mode and (
             self.tokenizer_manager.server_args.reasoning_parser is None
         )
+        print(
+            f"_process_messages xgrammar_reasoning: {xgrammar_reasoning}, thinking_mode: {thinking_mode}, reasoning_parser: {self.tokenizer_manager.server_args.reasoning_parser}"
+        )
         tool_call_constraint = None
 
         # Apply chat template and its stop strings
@@ -581,6 +584,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                     thinking_mode=xgrammar_reasoning,
                 )
+                print(f"_process_messages tool_call_constraint: {tool_call_constraint}")
             # Fallback: use generic JSON schema for required/named tool choice
             # only when no parser-specific constraint was set
             if tool_call_constraint is None and (
@@ -593,7 +597,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
-
+                print(
+                    f"_process_messages tool_call_constraint fallback: {tool_call_constraint}"
+                )
         # Use chat template
         if self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
@@ -601,6 +607,7 @@ class OpenAIServingChat(OpenAIServingBase):
             result = self._apply_conversation_template(request, is_multimodal)
 
         result.tool_call_constraint = tool_call_constraint
+        print(f"_process_messages result: {result}")
         return result
 
     def _apply_jinja_template(
@@ -1159,7 +1166,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         if not isinstance(ret, list):
             ret = [ret]
-
+        print(f"_handle_non_streaming_request ret: {ret}")
         response = self._build_chat_response(
             request,
             ret,
