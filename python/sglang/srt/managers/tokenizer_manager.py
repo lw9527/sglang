@@ -582,9 +582,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj = await self._tokenize_one_request(obj)
                 self._send_one_request(tokenized_obj)
                 async for response in self._wait_one_response(obj, request):
+                    print(f"_wait_one_response response: {response}")
                     yield response
             else:
                 async for response in self._handle_batch_request(obj, request):
+                    print(f"_handle_batch_request response: {response}")
                     yield response
 
     def _detect_input_format(

@@ -128,11 +128,12 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         else:
             os.environ["SGLANG_MAX_THINK_TOKENS"] = self._prev_budget
 
-    def _make_parser(self):
+    def _make_parser(self, tool_start_token="<tool_call>"):
         detector = SimpleNamespace(
             think_start_token="<think>",
             think_end_token="</think>",
             think_excluded_tokens=["<tool_call>", "</tool_call>"],
+            tool_start_token=tool_start_token,
         )
         return SimpleNamespace(detector=detector)
 
@@ -161,7 +162,25 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         self.assertIsInstance(obj, ReasonerGrammarObject)
         self.assertTrue(obj.enable_token_filter)
         self.assertEqual(obj.max_think_tokens, 2)
-        self.assertEqual(obj.think_excluded_token_ids, [3, 4])
+        self.assertEqual(obj.think_excluded_token_ids, [4])
+
+    def test_tool_start_token_enters_generation_and_forwards_to_inner_grammar(self):
+        backend = _DummyGrammarBackend(support_token_filter=True)
+        inner_grammar = MagicMock()
+        backend._dispatch_result = inner_grammar
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            self._make_parser(tool_start_token="<tool_call>"),
+            self._make_tokenizer(),
+            enable_strict_thinking=False,
+        )
+
+        wrapped = reasoner._init_value_dispatch(("json", "{}"), reasoning=True)
+        wrapped.accept_token(10)
+        wrapped.accept_token(3)
+        inner_grammar.accept_token.assert_called_once_with(3)
+        wrapped.accept_token(42)
+        inner_grammar.accept_token.assert_called_with(42)
 
     def test_init_strict_reasoning_grammar_none_when_strict_disabled(self):
         backend = _DummyGrammarBackend(support_token_filter=True)

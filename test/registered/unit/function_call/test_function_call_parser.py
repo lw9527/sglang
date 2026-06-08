@@ -3073,6 +3073,27 @@ class TestGlm47MoeDetector(unittest.TestCase):
         ]
         self.detector = Glm47MoeDetector()
 
+    def test_supports_structural_tag(self):
+        self.assertTrue(self.detector.supports_structural_tag())
+
+    def test_get_structural_tag_name(self):
+        self.assertEqual(self.detector.get_structural_tag_name(), "glm_4_7")
+
+    def test_get_model_structural_tag(self):
+        import xgrammar as xgr
+
+        structural_tag = self.detector.get_structural_tag(
+            self.tools, thinking_mode=False, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        payload = structural_tag.model_dump()
+        suffix = payload["format"]
+        self.assertEqual(suffix["type"], "triggered_tags")
+        self.assertTrue(suffix["at_least_one"])
+        self.assertEqual(suffix["triggers"], ["<tool_call>get_weather"])
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
     def test_single_tool_call(self):
         text = (
             "<tool_call>get_weather"

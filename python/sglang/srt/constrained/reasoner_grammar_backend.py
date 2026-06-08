@@ -46,6 +46,10 @@ class ReasonerGrammarObject(BaseGrammarObject):
     model to exit the thinking phase.
     When enable_token_filter=False (non-strict mode), fill_vocab_mask is
     a no-op during THINKING.
+
+    Some models (e.g. GLM) may end reasoning at tool_start_token instead of
+    think_end_token. In that case the matched tool_start tokens are forwarded
+    to the inner grammar so structural tags can begin at the tool call.
     """
 
     def __init__(
@@ -59,6 +63,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         allocate_vocab_mask_fn=None,
         move_vocab_mask_fn=None,
         apply_vocab_mask_fn=None,
+        tool_start_token_ids: Optional[List[int]] = None,
     ):
         super().__init__()
         self.grammar = grammar
@@ -70,10 +75,12 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.allocate_vocab_mask_fn = allocate_vocab_mask_fn
         self.move_vocab_mask_fn = move_vocab_mask_fn
         self.apply_vocab_mask_fn = apply_vocab_mask_fn
+        self.tool_start_token_ids = tool_start_token_ids or []
         self._think_end_id_list = [think_end_id]
 
         self.tokens_in_think = -1
         self.tokens_after_end = -1
+        self._tool_start_match_progress = 0
 
     def maybe_init_reasoning(self, reasoning: bool):
         if reasoning:
@@ -88,12 +95,30 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def _is_generation(self):
         return self.tokens_after_end >= 0
 
+    def _match_tool_start_token(self, token: int) -> bool:
+        if not self.tool_start_token_ids:
+            return False
+        expected = self.tool_start_token_ids[self._tool_start_match_progress]
+        if token != expected:
+            self._tool_start_match_progress = 0
+            if token == self.tool_start_token_ids[0]:
+                self._tool_start_match_progress = 1
+            return self._tool_start_match_progress == len(self.tool_start_token_ids)
+        self._tool_start_match_progress += 1
+        if self._tool_start_match_progress == len(self.tool_start_token_ids):
+            self._tool_start_match_progress = 0
+            return True
+        return False
+
     def transfer_state(self, token: int) -> None:
         if self._is_thinking():
             if token == self.think_end_id:
                 self.tokens_after_end = 0
-            else:
-                self.tokens_in_think += 1
+                return
+            if self._match_tool_start_token(token):
+                self.tokens_after_end = 0
+                return
+            self.tokens_in_think += 1
         elif self._is_generation():
             self.tokens_after_end += 1
 
@@ -104,10 +129,24 @@ class ReasonerGrammarObject(BaseGrammarObject):
         elif self._is_generation():
             if self.tokens_after_end == 0:
                 self.tokens_after_end = -1
+                self._tool_start_match_progress = 0
             elif self.tokens_after_end > 0:
                 self.tokens_after_end -= 1
 
     def accept_token(self, token: int):
+        if self._is_thinking():
+            if token == self.think_end_id:
+                self.transfer_state(token)
+                return
+            if self._match_tool_start_token(token):
+                if self.grammar is not None:
+                    for tool_token_id in self.tool_start_token_ids:
+                        self.grammar.accept_token(tool_token_id)
+                self.tokens_after_end = 0
+                return
+            self.transfer_state(token)
+            return
+
         if self._is_generation() and self.grammar is not None:
             self.grammar.accept_token(token)
         self.transfer_state(token)
@@ -179,9 +218,11 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self.allocate_vocab_mask_fn,
             self.move_vocab_mask_fn,
             self.apply_vocab_mask_fn,
+            self.tool_start_token_ids,
         )
         new_obj.tokens_in_think = self.tokens_in_think
         new_obj.tokens_after_end = self.tokens_after_end
+        new_obj._tool_start_match_progress = self._tool_start_match_progress
         new_obj._finished = self._finished
         return new_obj
 
@@ -239,6 +280,9 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
                 "must encode to exactly one token for constrained reasoning."
             )
         self.think_end_id = think_end_ids[0]
+        self.tool_start_token_ids = self._get_tool_start_token_ids(
+            reasoning_parser, tokenizer
+        )
         self._enable_strict_thinking = enable_strict_thinking
         self.think_excluded_token_ids = self._get_think_excluded_token_ids(
             reasoning_parser, tokenizer
@@ -263,6 +307,22 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             self.grammar_backend.set_token_filter if self.enable_token_filter else None
         )
 
+    def _get_tool_start_token_ids(
+        self,
+        reasoning_parser: ReasoningParser,
+        tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
+    ) -> List[int]:
+        tool_start_token = getattr(reasoning_parser.detector, "tool_start_token", None)
+        if not tool_start_token:
+            return []
+        token_ids = tokenizer.encode(tool_start_token, add_special_tokens=False)
+        if not token_ids:
+            raise ValueError(
+                f"tool_start_token '{tool_start_token}' could not be encoded by the "
+                f"tokenizer."
+            )
+        return token_ids
+
     def _get_think_excluded_token_ids(
         self,
         reasoning_parser: ReasoningParser,
@@ -273,7 +333,10 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             not reasoning_parser.detector.think_excluded_tokens
         ):
             return None
+        tool_start_token = getattr(reasoning_parser.detector, "tool_start_token", None)
         for token in reasoning_parser.detector.think_excluded_tokens:
+            if tool_start_token and token == tool_start_token:
+                continue
             new_ids = tokenizer.encode(token, add_special_tokens=False)
             if not new_ids:
                 raise ValueError(
@@ -297,6 +360,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             allocate_vocab_mask_fn=self.grammar_backend.allocate_vocab_mask,
             move_vocab_mask_fn=self.grammar_backend.move_vocab_mask,
             apply_vocab_mask_fn=self.grammar_backend.apply_vocab_mask,
+            tool_start_token_ids=self.tool_start_token_ids,
         )
         obj.maybe_init_reasoning(reasoning)
         return obj
