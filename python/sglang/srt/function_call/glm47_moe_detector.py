@@ -781,7 +781,11 @@ class Glm47MoeDetector(BaseFormatDetector):
         return arguments
 
     def supports_structural_tag(self) -> bool:
-        return False
+        return True
+
+    def get_structural_tag_name(self) -> str:
+        """XGrammar builtin key for GLM-4.7/GLM-5 XML tool-call format."""
+        return "glm_4_7"
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError()
