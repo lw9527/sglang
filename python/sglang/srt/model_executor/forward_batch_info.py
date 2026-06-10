@@ -246,6 +246,30 @@ def _fill_scalar_int32_on_device(
     return buf
 
 
+def _fill_int64_list_on_device(
+    model_runner: "ModelRunner",
+    attr_name: str,
+    values: List[int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Reuse a device buffer and assign from Python ints to avoid H2D during capture."""
+    n = len(values)
+    buf = getattr(model_runner, attr_name, None)
+    if buf is None or buf.numel() < n:
+        cap = max(n, 16)
+        buf = torch.empty(cap, dtype=torch.int64, device=device)
+        setattr(model_runner, attr_name, buf)
+    view = buf[:n]
+    if n == 0:
+        return view
+    if len(set(values)) == 1:
+        view.fill_(values[0])
+    else:
+        for i, v in enumerate(values):
+            view[i] = v
+    return view
+
+
 @dataclass
 class NgramEmbeddingInfo:
     """Ngram embedding state for LongCat models."""
@@ -638,13 +662,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             ret.original_global_num_tokens_cpu = batch.global_num_tokens
             ret.global_num_tokens_cpu = global_num_tokens
-            ret.global_num_tokens_gpu = torch.tensor(
-                global_num_tokens, dtype=torch.int64, device=device
+            ret.global_num_tokens_gpu = _fill_int64_list_on_device(
+                model_runner,
+                "_global_num_tokens_gpu_buf",
+                global_num_tokens,
+                device,
             )
 
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-            ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                global_num_tokens_for_logprob, dtype=torch.int64, device=device
+            ret.global_num_tokens_for_logprob_gpu = _fill_int64_list_on_device(
+                model_runner,
+                "_global_num_tokens_for_logprob_gpu_buf",
+                global_num_tokens_for_logprob,
+                device,
             )
 
         if ret.forward_mode.is_idle():
