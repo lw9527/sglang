@@ -167,6 +167,8 @@ class EagleDraftInputV2Mixin:
         draft_model_runner: ModelRunner,
         topk: int,
         num_steps: int,
+        *,
+        for_cuda_graph_replay: bool = True,
     ):
         if not batch.forward_mode.is_idle():
             bs = len(batch.seq_lens)
@@ -198,8 +200,28 @@ class EagleDraftInputV2Mixin:
         )
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         batch.capture_hidden_mode = capture_mode
-        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
-        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
+
+        use_cuda_graph_batch = (
+            for_cuda_graph_replay
+            and cuda_graph_runner is not None
+            and not batch.forward_mode.is_idle()
+            and batch.out_cache_loc is not None
+            and cuda_graph_runner.can_run_from_schedule_batch(batch)
+        )
+        if use_cuda_graph_batch:
+            # Plan B: skip init_new on the graph replay path to avoid H2D inside
+            # capture context; replay() copies into pre-allocated graph buffers.
+            batch.capture_hidden_mode = None
+            forward_batch = cuda_graph_runner.build_forward_batch_for_replay(
+                batch, self, capture_mode
+            )
+            can_cuda_graph = True
+        else:
+            forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+            can_cuda_graph = (
+                cuda_graph_runner is not None
+                and cuda_graph_runner.can_run(forward_batch)
+            )
         return forward_batch, can_cuda_graph
 
     def prepare_for_extend_to_fill_draft_kvcache(

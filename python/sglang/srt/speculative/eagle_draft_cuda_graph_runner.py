@@ -37,6 +37,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
 
@@ -202,27 +203,115 @@ class EAGLEDraftCudaGraphRunner:
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def _cuda_graph_bs_from_global_tokens(
+        self, global_num_tokens_cpu: list[int], raw_bs: int
+    ) -> int:
         if self.require_mlp_tp_gather:
-            cuda_graph_bs = (
-                max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
+            return (
+                max(global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
-                else max(forward_batch.global_num_tokens_cpu)
+                else max(global_num_tokens_cpu)
             )
-        else:
-            cuda_graph_bs = forward_batch.batch_size
+        return raw_bs
 
+    def _is_cuda_graph_bs_supported(
+        self, cuda_graph_bs: int, can_run_dp_cuda_graph: bool
+    ) -> bool:
         is_bs_supported = (
             cuda_graph_bs in self.graphs
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
-
         if self.require_mlp_sync:
-            is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
-
+            is_bs_supported = is_bs_supported and can_run_dp_cuda_graph
         return is_bs_supported
+
+    def can_run_from_schedule_batch(self, batch: ScheduleBatch) -> bool:
+        raw_bs = len(batch.seq_lens)
+        if self.require_mlp_tp_gather:
+            if batch.global_num_tokens is None:
+                return False
+            if batch.spec_info is not None:
+                global_num_tokens_cpu, _ = (
+                    batch.spec_info.get_spec_adjusted_global_num_tokens(batch)
+                )
+            else:
+                global_num_tokens_cpu = batch.global_num_tokens
+            cuda_graph_bs = self._cuda_graph_bs_from_global_tokens(
+                global_num_tokens_cpu, raw_bs
+            )
+        else:
+            cuda_graph_bs = raw_bs
+        return self._is_cuda_graph_bs_supported(
+            cuda_graph_bs, batch.can_run_dp_cuda_graph
+        )
+
+    def build_forward_batch_for_replay(
+        self,
+        batch: ScheduleBatch,
+        draft_input: EagleDraftInput,
+        capture_hidden_mode: CaptureHiddenMode,
+    ) -> ForwardBatch:
+        """Build a lightweight ForwardBatch for cuda-graph replay.
+
+        Mirrors ``capture_one_batch_size`` / ``replay()`` buffer wiring without
+        calling ``ForwardBatch.init_new``, so no H2D happens inside graph capture
+        context on the forward stream.
+        """
+        raw_bs = len(batch.seq_lens)
+
+        global_num_tokens_cpu = None
+        global_num_tokens_for_logprob_cpu = None
+        if batch.global_num_tokens is not None:
+            assert batch.global_num_tokens_for_logprob is not None
+            if batch.spec_info is not None:
+                global_num_tokens_cpu, global_num_tokens_for_logprob_cpu = (
+                    batch.spec_info.get_spec_adjusted_global_num_tokens(batch)
+                )
+            else:
+                global_num_tokens_cpu = batch.global_num_tokens
+                global_num_tokens_for_logprob_cpu = batch.global_num_tokens_for_logprob
+
+        seq_lens_cpu = batch.seq_lens_cpu
+        if batch.seq_lens_cpu_cache is not None:
+            seq_lens_cpu = batch.seq_lens_cpu_cache
+            batch.seq_lens_cpu_cache = None
+
+        seq_lens_sum = batch.seq_lens_sum
+        if seq_lens_sum is None and seq_lens_cpu is not None:
+            seq_lens_sum = int(seq_lens_cpu.sum())
+
+        return ForwardBatch(
+            forward_mode=batch.forward_mode,
+            batch_size=raw_bs,
+            input_ids=batch.input_ids,
+            req_pool_indices=batch.req_pool_indices,
+            seq_lens=batch.seq_lens,
+            out_cache_loc=batch.out_cache_loc,
+            seq_lens_sum=seq_lens_sum or 0,
+            seq_lens_cpu=seq_lens_cpu,
+            return_logprob=False,
+            positions=draft_input.positions,
+            spec_algorithm=batch.spec_algorithm,
+            spec_info=draft_input,
+            capture_hidden_mode=capture_hidden_mode,
+            can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
+            global_num_tokens_cpu=global_num_tokens_cpu,
+            global_num_tokens_for_logprob_cpu=global_num_tokens_for_logprob_cpu,
+        )
+
+    def can_run(self, forward_batch: ForwardBatch):
+        if self.require_mlp_tp_gather:
+            cuda_graph_bs = self._cuda_graph_bs_from_global_tokens(
+                forward_batch.global_num_tokens_cpu, forward_batch.batch_size
+            )
+        else:
+            cuda_graph_bs = forward_batch.batch_size
+
+        return self._is_cuda_graph_bs_supported(
+            cuda_graph_bs, forward_batch.can_run_dp_cuda_graph
+        )
 
     def _create_graph(self):
         return torch.cuda.CUDAGraph()

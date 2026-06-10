@@ -241,6 +241,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.draft_runner_list[0],
             self.topk,
             self.speculative_num_steps,
+            for_cuda_graph_replay=False,
         )
 
         # Run draft
