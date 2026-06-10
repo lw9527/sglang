@@ -231,6 +231,21 @@ def compute_local_num_token_non_padded(
     )
 
 
+def _fill_scalar_int32_on_device(
+    model_runner: "ModelRunner",
+    attr_name: str,
+    value: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Reuse a device scalar buffer to avoid H2D copy during NPU graph capture."""
+    buf = getattr(model_runner, attr_name, None)
+    if buf is None:
+        buf = torch.zeros((1,), dtype=torch.int32, device=device)
+        setattr(model_runner, attr_name, buf)
+    buf[0] = value
+    return buf
+
+
 @dataclass
 class NgramEmbeddingInfo:
     """Ngram embedding state for LongCat models."""
@@ -599,8 +614,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
-            ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).to(
-                device, non_blocking=True
+            ret.num_token_non_padded = _fill_scalar_int32_on_device(
+                model_runner,
+                "_num_token_non_padded_scalar",
+                num_tokens,
+                device,
             )
         ret.num_token_non_padded_cpu = num_tokens
 
@@ -621,13 +639,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.original_global_num_tokens_cpu = batch.global_num_tokens
             ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
-                global_num_tokens, dtype=torch.int64
-            ).to(device, non_blocking=True)
+                global_num_tokens, dtype=torch.int64, device=device
+            )
 
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                global_num_tokens_for_logprob, dtype=torch.int64
-            ).to(device, non_blocking=True)
+                global_num_tokens_for_logprob, dtype=torch.int64, device=device
+            )
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
