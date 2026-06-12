@@ -216,10 +216,44 @@ def alloc_with_pin_memory(
     return buffer
 
 
+def alloc_with_npu_host_register(
+    dims,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: HostTensorAllocator,
+) -> torch.Tensor:
+    """
+    Allocate Ascend SVM host memory for HiCache kernel_ascend D2H.
+
+    torch.empty(..., pin_memory=True) only OS-locks pages; aclrtMemcpy2dAsync
+    requires aclrtMallocHost buffers (is_svm_addr=1).
+    """
+    if not pin_memory:
+        if allocator is not None:
+            return allocator.allocate(dims, dtype=dtype, device=device)
+        return torch.empty(dims, dtype=dtype, device=device)
+
+    import torch_npu  # noqa: F401
+
+    npu_device = torch.device("npu", torch.npu.current_device())
+    buffer = torch.empty(dims, dtype=dtype, device="cpu")
+    try:
+        pinned = buffer.pin_memory(npu_device)
+    except TypeError:
+        pinned = buffer.pin_memory()
+    if hasattr(pinned, "is_pinned") and not pinned.is_pinned():
+        raise RuntimeError(
+            "NPU pinned host allocation failed; HiCache kernel_ascend D2H "
+            "requires aclrtMallocHost (SVM) buffers."
+        )
+    return pinned
+
+
 ALLOC_MEMORY_FUNCS = defaultdict(
     lambda: alloc_with_host_register,
     {
-        "npu": alloc_with_pin_memory,
+        "npu": alloc_with_npu_host_register,
         "musa": alloc_with_pin_memory,
     },
 )
