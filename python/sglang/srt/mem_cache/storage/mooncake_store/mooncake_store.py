@@ -327,6 +327,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         # Always include the anchor KV buffer if present.
         _add_tensor(getattr(mem_pool, "kv_buffer", None))
+        _add_tensor(getattr(mem_pool, "kv_l3_buffer", None))
 
         # HostPoolGroup: include each pool's hybrid buffers when available.
         entries = getattr(mem_pool, "entries", None)
@@ -337,6 +338,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     continue
                 # KV pool anchor memory is already covered, but harmless if added twice.
                 _add_tensor(getattr(host_pool, "kv_buffer", None))
+                _add_tensor(getattr(host_pool, "kv_l3_buffer", None))
                 for buf in getattr(host_pool, "get_hybrid_pool_buffer", lambda: [])():
                     _add_tensor(buf)
             return total
@@ -609,10 +611,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ], "mooncake store storage backend only support page first, page first direct, page head and  page_first_kv_split layout"
         try:
             if self.mem_pool_host.layout == "page_first_kv_split":
-                super().register_buffer(self.mem_pool_host.k_buffer)
-                super().register_buffer(self.mem_pool_host.v_buffer)
-                if self.mem_pool_host.index_k_buffer is not None:
-                    super().register_buffer(self.mem_pool_host.index_k_buffer)
+                super().register_buffer(self.mem_pool_host.kv_l3_buffer)
             else:
                 super().register_buffer(self.mem_pool_host.kv_buffer)
         except TypeError as err:
@@ -621,16 +620,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
-
-    def _is_mla_kv_split_layout(self) -> bool:
-        return (
-            self.is_mla_backend
-            and self.mem_pool_host is not None
-            and self.mem_pool_host.layout == "page_first_kv_split"
-        )
-
-    def _mla_page_key_multiplier(self) -> int:
-        return 2 if self._is_mla_kv_split_layout() else 1
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         # KV anchor memory is already registered via register_mem_pool_host().
@@ -825,13 +814,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _get_mla_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
         key_list = []
-        if self._is_mla_kv_split_layout():
-            for key_ in keys:
-                key_list.append(f"{key_}_{self.mla_suffix}_k")
-                key_list.append(f"{key_}_{self.mla_suffix}_v")
-        else:
-            for key_ in keys:
-                key_list.append(f"{key_}_{self.mla_suffix}_k")
+        for key_ in keys:
+            key_list.append(f"{key_}_{self.mla_suffix}_k")
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
@@ -858,7 +842,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         """
         if key_multiplier is None:
             if self.is_mla_backend:
-                key_multiplier = self._mla_page_key_multiplier()
+                key_multiplier = 1
             else:
                 key_multiplier = 2
                 if self.storage_config.should_split_heads:
@@ -1051,7 +1035,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         end_time = time.perf_counter()
 
         if self.is_mla_backend:
-            key_multiplier = self._mla_page_key_multiplier()
+            key_multiplier = 1
         else:
             key_multiplier = 2
 
@@ -1077,15 +1061,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
-            if self._is_mla_kv_split_layout():
-                query_keys = []
-                for key in keys:
-                    query_keys.append(f"{key}_{self.mla_suffix}_k")
-                    query_keys.append(f"{key}_{self.mla_suffix}_v")
-                key_multiplier = 2
-            else:
-                query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
-                key_multiplier = 1
+            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
+            key_multiplier = 1
         else:
             query_keys = []
             if self.storage_config.should_split_heads:
