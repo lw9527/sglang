@@ -346,6 +346,59 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             _add_tensor(buf)
         return total
 
+    @staticmethod
+    def _standalone_stagger_rank(storage_config: Optional[HiCacheStorageConfig]) -> int:
+        """Unique rank index for staggering IPC to a shared mooncake_client sidecar."""
+        if storage_config is None:
+            return 0
+        return (
+            storage_config.pp_rank
+            * storage_config.attn_cp_size
+            * storage_config.tp_size
+            + storage_config.attn_cp_rank * storage_config.tp_size
+            + storage_config.tp_rank
+        )
+
+    def _setup_standalone_dummy(
+        self,
+        required_bytes: int,
+        storage_config: Optional[HiCacheStorageConfig],
+    ) -> None:
+        """Connect dummy client to the sidecar mooncake_client with retry.
+
+        All ranks in a pod share one sidecar IPC server. Concurrent setup_dummy
+        calls can time out when the sidecar is busy (e.g. blocked on transfers).
+        """
+        stagger_rank = self._standalone_stagger_rank(storage_config)
+        max_retries = 10
+        retry_delay = 2.0
+        time.sleep(stagger_rank * 0.5)
+
+        ret_code = -1
+        for attempt in range(max_retries):
+            ret_code = self.store.setup_dummy(
+                required_bytes,
+                DEFAULT_LOCAL_BUFFER_SIZE,
+                self.config.client_server_address,
+            )
+            if ret_code == 0:
+                return
+            logger.warning(
+                "setup_dummy failed (attempt %s/%s, stagger_rank=%s), "
+                "ret=%s, retrying in %.1fs...",
+                attempt + 1,
+                max_retries,
+                stagger_rank,
+                ret_code,
+                retry_delay,
+            )
+            time.sleep(retry_delay)
+
+        raise RuntimeError(
+            f"Failed to setup Mooncake store via setup_dummy after "
+            f"{max_retries} attempts, error code: {ret_code}"
+        )
+
     def __init__(
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
@@ -402,11 +455,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         "or upgrade Mooncake by 'pip install mooncake --upgrade'."
                     )
                 required_bytes = self._standalone_required_bytes(mem_pool)
-                ret_code = self.store.setup_dummy(
-                    required_bytes,
-                    DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
-                    self.config.client_server_address,
-                )
+                self._setup_standalone_dummy(required_bytes, storage_config)
+                ret_code = 0
             else:
                 try:
                     from sglang.srt.distributed.parallel_state import (
@@ -502,6 +552,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.attn_cp_rank = 0
                 self.attn_cp_size = 1
 
+            self.mla_kv_split_layout = False
+
             self.enable_pp = self.pp_size > 1
             if self.enable_pp:
                 self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
@@ -573,6 +625,34 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             logger.error("Launch mooncake store server timeout")
             raise ValueError("Launch mooncake store server timeout")
 
+    def _warmup_put(self, key: str, value: bytes) -> int:
+        """Submit a warmup put.
+
+        In standalone (dummy-real) mode on Ascend, put() fails because the real
+        client RPC thread does not set ACL context. batch_put_from() does, but
+        the source pointer must live inside dummy-client SHM registered with the
+        real client (see Mooncake test_dummy_client.test_batch_put_from).
+        """
+        if not self.config.standalone_storage:
+            return self.store.put(key, value)
+
+        size = len(value)
+        ptr = self.store.alloc_from_mem_pool(size)
+        if ptr == 0:
+            return -1
+        reg_ret = self.store.register_buffer(ptr, size)
+        if reg_ret != 0:
+            return reg_ret
+
+        ctypes.memmove(ptr, value, size)
+        try:
+            results = self.store.batch_put_from([key], [ptr], [size])
+            if not results:
+                return -1
+            return results[0]
+        finally:
+            self.store.unregister_buffer(ptr)
+
     def warmup(self):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
         warmup_value = bytes(4 * 1024)  # 4 KB
@@ -581,8 +661,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         max_retries = 10
         retry_delay = 1.0  # seconds
 
+        time.sleep(self.local_rank * 0.25)
+
         for attempt in range(max_retries):
-            ret = self.store.put(warmup_key, warmup_value)
+            ret = self._warmup_put(warmup_key, warmup_value)
             if ret == 0:
                 break
             logger.warning(
@@ -607,9 +689,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             "page_head",
             "page_first_kv_split",
         ], "mooncake store storage backend only support page first, page first direct, page head and  page_first_kv_split layout"
-        buffer = self.mem_pool_host.kv_buffer
+        self.mla_kv_split_layout = (
+            self.is_mla_backend and mem_pool_host.layout == "page_first_kv_split"
+        )
         try:
-            super().register_buffer(buffer)
+            if mem_pool_host.layout == "page_first_kv_split":
+                super().register_buffer(mem_pool_host.k_buffer)
+                super().register_buffer(mem_pool_host.v_buffer)
+            else:
+                super().register_buffer(self.mem_pool_host.kv_buffer)
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
@@ -808,10 +896,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return key_list, ptr_list, element_size_list
 
     def _get_mla_buffer_meta(self, keys, indices):
-        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
-        key_list = []
-        for key_ in keys:
-            key_list.append(f"{key_}_{self.mla_suffix}_k")
+        if self.mla_kv_split_layout:
+            ptr_list, element_size_list = (
+                self.mem_pool_host.get_kv_split_page_buffer_meta(indices)
+            )
+            key_list = []
+            for key_ in keys:
+                key_list.append(f"{key_}_{self.mla_suffix}_k")
+                key_list.append(f"{key_}_{self.mla_suffix}_rope")
+        else:
+            ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(
+                indices
+            )
+            key_list = []
+            for key_ in keys:
+                key_list.append(f"{key_}_{self.mla_suffix}_k")
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
@@ -838,7 +937,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         """
         if key_multiplier is None:
             if self.is_mla_backend:
-                key_multiplier = 1
+                key_multiplier = 2 if self.mla_kv_split_layout else 1
             else:
                 key_multiplier = 2
                 if self.storage_config.should_split_heads:
@@ -1031,7 +1130,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         end_time = time.perf_counter()
 
         if self.is_mla_backend:
-            key_multiplier = 1
+            key_multiplier = 2 if self.mla_kv_split_layout else 1
         else:
             key_multiplier = 2
 
@@ -1057,8 +1156,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
-            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
-            key_multiplier = 1
+            if self.mla_kv_split_layout:
+                query_keys = []
+                for key in keys:
+                    query_keys.append(f"{key}_{self.mla_suffix}_k")
+                    query_keys.append(f"{key}_{self.mla_suffix}_rope")
+                key_multiplier = 2
+            else:
+                query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
+                key_multiplier = 1
         else:
             query_keys = []
             if self.storage_config.should_split_heads:

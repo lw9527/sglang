@@ -1288,6 +1288,27 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
+    def get_kv_split_page_buffer_meta(self, indices):
+        """Meta data for zero-copy L3 I/O with page_first_kv_split layout."""
+        assert self.layout == "page_first_kv_split"
+        assert len(indices) % self.page_size == 0
+        ptr_list = []
+        element_size_list = []
+        k_base = self.k_buffer.data_ptr()
+        v_base = self.v_buffer.data_ptr()
+        indices = indices.tolist()
+        k_stride = self.layer_num * self.kv_lora_rank * self.dtype.itemsize
+        v_stride = self.layer_num * self.qk_rope_head_dim * self.dtype.itemsize
+        k_page_bytes = k_stride * self.page_size
+        v_page_bytes = v_stride * self.page_size
+        for index in range(0, len(indices), self.page_size):
+            page_off = indices[index]
+            ptr_list.append(k_base + page_off * k_stride)
+            ptr_list.append(v_base + page_off * v_stride)
+            element_size_list.append(k_page_bytes)
+            element_size_list.append(v_page_bytes)
+        return ptr_list, element_size_list
+
     def get_page_buffer_meta(self, indices):
         """ "
         meta data for zero copy
