@@ -1290,6 +1290,43 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 * self.kv_cache_dim
             )
             element_size_list = [element_size] * len(ptr_list)
+        elif self.layout == "page_first_kv_split":
+            k_buffer_data_ptr = self.k_buffer.data_ptr()
+            v_buffer_data_ptr = self.v_buffer.data_ptr()
+            k_element_size = (
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
+                * self.kv_lora_rank
+            )
+            v_element_size = (
+                self.layer_num
+                * self.dtype.itemsize
+                * self.page_size
+                * self.qk_rope_head_dim
+            )
+            for index in range(0, len(indices), self.page_size):
+                token_index = indices[index]
+                k_ptr = (
+                    k_buffer_data_ptr
+                    + token_index
+                    * self.layer_num
+                    * self.kv_lora_rank
+                    * self.dtype.itemsize
+                )
+                v_ptr = (
+                    v_buffer_data_ptr
+                    + token_index
+                    * self.layer_num
+                    * self.qk_rope_head_dim
+                    * self.dtype.itemsize
+                )
+                ptr_list.append(k_ptr)
+                ptr_list.append(v_ptr)
+            element_size_list = []
+            for _ in range(len(indices) // self.page_size):
+                element_size_list.append(k_element_size)
+                element_size_list.append(v_element_size)
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
@@ -1306,8 +1343,33 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         For this to be page-aligned (given a page-aligned ``base_ptr``) the per-page
         stride must itself be a multiple of the OS page size.
         """
-        if self.layout not in ("page_first", "page_first_direct"):
+        if self.layout not in (
+            "page_first",
+            "page_first_direct",
+            "page_first_kv_split",
+        ):
             return False
+        if self.layout == "page_first_kv_split":
+            k_stride = (
+                self.page_size
+                * self.layer_num
+                * self.kv_lora_rank
+                * self.dtype.itemsize
+            )
+            v_stride = (
+                self.page_size
+                * self.layer_num
+                * self.qk_rope_head_dim
+                * self.dtype.itemsize
+            )
+            k_aligned = self.k_buffer.data_ptr() % page_size_bytes == 0
+            v_aligned = self.v_buffer.data_ptr() % page_size_bytes == 0
+            return (
+                k_aligned
+                and v_aligned
+                and k_stride % page_size_bytes == 0
+                and v_stride % page_size_bytes == 0
+            )
         stride = (
             self.page_size * self.layer_num * self.kv_cache_dim * self.dtype.itemsize
         )
