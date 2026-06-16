@@ -553,6 +553,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.attn_cp_size = 1
 
             self.mla_kv_split_layout = False
+            self._kv_split_v_buffer_registered = False
 
             self.enable_pp = self.pp_size > 1
             if self.enable_pp:
@@ -663,23 +664,46 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         time.sleep(self.local_rank * 0.25)
 
+        warmup_deadline = time.monotonic() + 30.0
         for attempt in range(max_retries):
             ret = self._warmup_put(warmup_key, warmup_value)
             if ret == 0:
                 break
+            remaining = warmup_deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "[TP%s] Warmup put timed out after 30s (attempt %s, ret=%s); "
+                    "continuing without warmup.",
+                    self.local_rank,
+                    attempt + 1,
+                    ret,
+                )
+                return
+            sleep_time = min(retry_delay, remaining)
             logger.warning(
-                f"[TP{self.local_rank}] Warmup put failed (attempt {attempt + 1}/{max_retries}), "
-                f"ret={ret}, retrying in {retry_delay}s..."
+                "[TP%s] Warmup put failed (attempt %s/%s, ret=%s), retrying in %.1fs...",
+                self.local_rank,
+                attempt + 1,
+                max_retries,
+                ret,
+                sleep_time,
             )
-            time.sleep(retry_delay)
+            time.sleep(sleep_time)
         else:
-            raise RuntimeError(
-                f"[TP{self.local_rank}] Warmup put failed after {max_retries} attempts, "
-                "Transfer Engine might not be ready"
+            logger.warning(
+                "[TP%s] Warmup put failed after %s attempts; continuing without warmup.",
+                self.local_rank,
+                max_retries,
             )
+            return
 
-        assert self.store.is_exist(warmup_key) == 1
-        assert self.store.get(warmup_key) == warmup_value
+        if self.store.is_exist(warmup_key) != 1 or self.store.get(warmup_key) != (
+            warmup_value
+        ):
+            logger.warning(
+                "[TP%s] Warmup verification (is_exist/get) failed; continuing.",
+                self.local_rank,
+            )
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
@@ -694,8 +718,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         )
         try:
             if mem_pool_host.layout == "page_first_kv_split":
+                # Register k_buffer at init; defer v_buffer until first L3 I/O to
+                # shorten embedded Ascend startup (two large Host MRs per rank
+                # can stall ADXL for minutes and desync HCCL collectives).
                 super().register_buffer(mem_pool_host.k_buffer)
-                super().register_buffer(mem_pool_host.v_buffer)
+                self._kv_split_v_buffer_registered = False
             else:
                 super().register_buffer(self.mem_pool_host.kv_buffer)
         except TypeError as err:
@@ -704,6 +731,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
+
+    def _ensure_kv_split_v_buffer_registered(self) -> None:
+        if self._kv_split_v_buffer_registered:
+            return
+        super().register_buffer(self.mem_pool_host.v_buffer)
+        self._kv_split_v_buffer_registered = True
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         # KV anchor memory is already registered via register_mem_pool_host().
@@ -897,6 +930,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _get_mla_buffer_meta(self, keys, indices):
         if self.mla_kv_split_layout:
+            self._ensure_kv_split_v_buffer_registered()
             ptr_list, element_size_list = (
                 self.mem_pool_host.get_kv_split_page_buffer_meta(indices)
             )

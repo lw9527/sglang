@@ -497,6 +497,11 @@ class HiCacheController:
             and self.storage_config.tp_rank != 0
         )
 
+        # Create gloo prefetch sync groups before Mooncake warmup / host MR
+        # registration. Those steps can take minutes per rank on Ascend embedded
+        # L3 and must not run before a WORLD HCCL collective.
+        self._create_prefetch_sync_groups()
+
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
@@ -514,10 +519,6 @@ class HiCacheController:
             )
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
-
-            # Use dedicated gloo groups so storage prefetch sync is isolated
-            # from other collectives and consistent across CPxTP participants.
-            self._create_prefetch_sync_groups()
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get

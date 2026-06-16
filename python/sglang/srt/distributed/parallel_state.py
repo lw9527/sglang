@@ -2127,7 +2127,12 @@ def create_custom_parallel_group(
     local_config = sorted(list(set(group_ranks)))
     gathered_configs = [None for _ in range(world_size)]
 
-    torch.distributed.all_gather_object(gathered_configs, local_config)
+    # Use the WORLD gloo group: default HCCL WORLD can time out when ranks are
+    # still in long-running storage init (Mooncake warmup / MR registration).
+    world_cpu_group = get_world_group().cpu_group
+    torch.distributed.all_gather_object(
+        gathered_configs, local_config, group=world_cpu_group
+    )
 
     unique_groups = []
     seen_signatures = set()
