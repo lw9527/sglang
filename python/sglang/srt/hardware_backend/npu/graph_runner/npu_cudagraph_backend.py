@@ -87,6 +87,13 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         finally:
             self._capture_stream = None
 
+    def _drain_device_and_collectives(self) -> None:
+        # DeepEP/HCCL must finish before NPUGraph record/replay boundaries.
+        # Otherwise torch_npu warns about pending NCCL work at capture entry
+        # and Ascend can raise 107030 asynchronously (surfacing much later).
+        self._device_module.synchronize()
+        self._tp_group.barrier()
+
     def capture_one(
         self,
         shape_key: ShapeKey,
@@ -99,11 +106,13 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
         for _ in range(2):
-            self._device_module.synchronize()
-            self._tp_group.barrier()
+            self._drain_device_and_collectives()
             forward_fn()
             if post_warmup_hook is not None:
                 post_warmup_hook()
+            self._drain_device_and_collectives()
+
+        self._drain_device_and_collectives()
 
         graph = torch.npu.NPUGraph()
 
@@ -131,6 +140,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             auto_dispatch_capture=True,
         ):
             out = forward_fn()
+
+        self._drain_device_and_collectives()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
