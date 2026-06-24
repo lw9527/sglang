@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.configs.model_config import is_deepseek_dsa
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
@@ -33,6 +34,12 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
 
     def _cache_loc_dtype(self):
         return torch.int32
+
+    def replay(self, forward_batch: ForwardBatch):
+        self.device_module.synchronize()
+        out = super().replay(forward_batch)
+        self.device_module.synchronize()
+        return out
 
     def _replay_graph(self, shape_key, forward_batch):
         if not is_deepseek_dsa(self.model_runner.model_config.hf_config):

@@ -353,6 +353,8 @@ def eagle_prepare_for_verify(
     # Non-cuda-graph: defer init to forward_extend, which runs after
     # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing
     # here would use pre-pad shapes and trip DSv4 indexer shape match.
+    if _is_npu:
+        torch.get_device_module(target_worker.device).synchronize()
 
     return verify_forward_batch, can_run_cuda_graph
 

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Dict, Union
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -50,6 +51,15 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
 
     def _get_update_attr_type(self):
         return self.attr_type[AttentionArch.MLA]
+
+    def replay(self, forward_batch: ForwardBatch):
+        # EAGLEDraftCudaGraphRunner.replay() copies into graph buffers and calls
+        # init_forward_metadata_out_graph before NPUGraph replay, but unlike
+        # NPUGraphRunner.replay() it never drains the prior graph context.
+        self.device_module.synchronize()
+        out = super().replay(forward_batch)
+        self.device_module.synchronize()
+        return out
 
     def _replay_graph(self, shape_key, forward_batch):
         if not is_deepseek_dsa(self.model_runner.model_config.hf_config):
