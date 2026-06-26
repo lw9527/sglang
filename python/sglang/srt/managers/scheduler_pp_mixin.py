@@ -37,10 +37,17 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
+from sglang.srt.utils import (
+    DynamicGradMode,
+    broadcast_pyobj,
+    is_npu,
+    point_to_point_pyobj,
+)
 from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -1193,8 +1200,8 @@ class SchedulerPPMixin:
         # same time.
 
         # CUDA: send first
-        # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
+        # XPU/NPU: even ranks send first, odd ranks recv first.
+        send_first = (not (is_xpu() or _is_npu)) or ((self.ps.pp_rank % 2) == 0)
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
@@ -1218,6 +1225,11 @@ class SchedulerPPMixin:
                 next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
             with self.copy_stream_ctx:
                 self.copy_stream.wait_stream(self.schedule_stream)
+                if _is_npu:
+                    # NPU index_put_ in future_map.stash can synchronize all device
+                    # streams. With pp_async_batch_depth==0, stash runs right after
+                    # launch; wait for the current forward to finish first.
+                    self.copy_stream.wait_stream(self.forward_stream)
                 batch_result = self._pp_prep_batch_result(
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )

@@ -969,9 +969,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
-        # Calculate first full attention layer ID based on config
-        if self.attn.layer_id == (self.config.full_attention_interval - 1):
-            self.rotary_emb.get_cos_sin_with_position(positions)
+        # Each attention layer owns a separate rotary_emb with its own
+        # position_sin/cos buffers, so refresh on every layer (not just the first
+        # full-attn layer on this PP rank).
+        self.rotary_emb.get_cos_sin_with_position(positions)
 
         q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
             qkv,
