@@ -741,6 +741,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.rope_theta, rope_scaling = get_rope_config(config)
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.layer_id = layer_id
+        # First full-attention layer on this PP rank; parent model sets this after
+        # make_layers. When unset, fall back to the global first full-attn layer.
+        self.pp_first_attn_layer_id: Optional[int] = None
 
         # If rope_scaling doesn't specify a scaling type, treat as no scaling
         if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):
@@ -969,8 +972,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
-        # Calculate first full attention layer ID based on config
-        if self.attn.layer_id == (self.config.full_attention_interval - 1):
+        # Refresh shared RoPE cos/sin once per forward on the first full-attention
+        # layer of this PP rank (see Qwen3_5ForCausalLM.__init__). The old global
+        # full_attention_interval - 1 check breaks under PP because that layer may
+        # live on another rank, leaving position_sin/cos None on this rank.
+        rope_refresh_layer_id = (
+            self.pp_first_attn_layer_id
+            if self.pp_first_attn_layer_id is not None
+            else (self.config.full_attention_interval - 1)
+        )
+        if self.attn.layer_id == rope_refresh_layer_id:
             self.rotary_emb.get_cos_sin_with_position(positions)
 
         q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
@@ -1233,6 +1244,20 @@ class Qwen3_5ForCausalLM(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
+
+        pp_first_attn_layer_id = next(
+            (
+                idx
+                for idx in range(self._start_layer, self._end_layer)
+                if config.layers_block_type[idx] == "attention"
+            ),
+            None,
+        )
+        if pp_first_attn_layer_id is not None:
+            for idx in range(self._start_layer, self._end_layer):
+                layer = self.layers[idx]
+                if isinstance(layer, Qwen3_5AttentionDecoderLayer):
+                    layer.pp_first_attn_layer_id = pp_first_attn_layer_id
 
         # Final normalization
         if self.pp_group.is_last_rank:
