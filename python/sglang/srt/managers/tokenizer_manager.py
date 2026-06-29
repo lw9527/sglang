@@ -2393,6 +2393,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             or obj.sampling_params.get("structural_tag", None)
         )
 
+    @staticmethod
+    def _should_skip_ttft_for_abort_without_tokens(
+        finished_reason, completion_tokens: int
+    ) -> bool:
+        # Timeout abort typically finishes without any generated token. Client-side
+        # send-timeout abort_request and server-side req timeout both hit this path.
+        if completion_tokens > 0:
+            return False
+        if isinstance(finished_reason, dict):
+            return finished_reason.get("type") == "abort"
+        to_json = getattr(finished_reason, "to_json", None)
+        if not callable(to_json):
+            return False
+        data = to_json()
+        return isinstance(data, dict) and data.get("type") == "abort"
+
     def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
         completion_tokens = (
             recv_obj.completion_tokens[i]
@@ -2408,15 +2424,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             priority = getattr(state.obj, "priority", None)
             if priority is not None:
                 labels["priority"] = str(priority)
+        finished_reason = (
+            recv_obj.finished_reasons[i]
+            if getattr(recv_obj, "finished_reasons", None)
+            and i < len(recv_obj.finished_reasons)
+            else None
+        )
         if (
             not state.ttft_observed
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
             state.ttft_observed = True
             state.last_completion_tokens = completion_tokens
-            self.metrics_collector.observe_time_to_first_token(
-                labels, state.time_stats.get_first_token_latency()
-            )
+            if not self._should_skip_ttft_for_abort_without_tokens(
+                finished_reason, completion_tokens
+            ):
+                self.metrics_collector.observe_time_to_first_token(
+                    labels, state.time_stats.get_first_token_latency()
+                )
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
             if num_new_tokens:
