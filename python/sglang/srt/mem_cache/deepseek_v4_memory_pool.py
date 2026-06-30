@@ -312,7 +312,7 @@ class DeepSeekV4IndexerPool(KVCache):
         raise NotImplementedError()
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
-        return self.index_k_with_scale_buffer[layer_id]
+        return self.index_k_with_scale_buffer[layer_id - self.start_layer]
 
     def get_index_k_scale_buffer(
         self,
@@ -320,7 +320,7 @@ class DeepSeekV4IndexerPool(KVCache):
         seq_len: int,
         page_indices: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        buf = self.index_k_with_scale_buffer[layer_id]
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         return index_buf_accessor.GetKAndS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
