@@ -266,20 +266,22 @@ class EagerRunner(BaseRunner):
         if forward_batch.needs_forward_metadata_init():
             if hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp"):
                 # prepare kv cache buffer for dcp to gather kv cache
-                forward_batch.attn_dcp_metadata = (
-                    model_runner.model.prepare_context_parallel_metadata_for_dcp(
-                        forward_batch.seq_lens,
-                        forward_batch.extend_prefix_lens,
-                        forward_batch.extend_prefix_lens_cpu,
-                        forward_batch.extend_seq_lens,
-                        forward_batch.req_pool_indices,
-                        get_req_to_token_pool().req_to_token,
-                        forward_batch.seq_lens_sum,
-                        get_token_to_kv_pool().get_key_buffer(0).shape,
-                        model_runner.kv_cache_dtype,
-                        model_runner.device,
-                        create_chunked_prefix_cache_kv_indices,
-                    )
+                kv_pool = get_token_to_kv_pool()
+                forward_batch.attn_dcp_metadata = model_runner.model.prepare_context_parallel_metadata_for_dcp(
+                    forward_batch.seq_lens,
+                    forward_batch.extend_prefix_lens,
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.extend_seq_lens,
+                    forward_batch.req_pool_indices,
+                    get_req_to_token_pool().req_to_token,
+                    forward_batch.seq_lens_sum,
+                    # Use this PP rank's first owned layer; under PP the KV
+                    # pool only holds [start_layer, end_layer], and
+                    # get_key_buffer() indexes via (layer_id - start_layer).
+                    kv_pool.get_key_buffer(kv_pool.start_layer).shape,
+                    model_runner.kv_cache_dtype,
+                    model_runner.device,
+                    create_chunked_prefix_cache_kv_indices,
                 )
             if hasattr(model_runner.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
