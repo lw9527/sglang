@@ -4,7 +4,11 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.disaggregation.npu_ipc_utils import log_ipc_regions
+from sglang.srt.disaggregation.npu_ipc_utils import (
+    align_npu_ipc_regions,
+    log_ipc_regions,
+    needs_npu_ipc_alignment,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
@@ -89,8 +93,11 @@ class AscendTransferEngine(MooncakeTransferEngine):
         names: Optional[List[str]] = None,
     ):
         log_ipc_regions("AscendTransferEngine.batch_register", ptrs, lengths, names)
+        reg_ptrs, reg_lens = ptrs, lengths
+        if needs_npu_ipc_alignment():
+            reg_ptrs, reg_lens = align_npu_ipc_regions(ptrs, lengths)
         try:
-            ret_value = self.engine.batch_register_memory(ptrs, lengths)
+            ret_value = self.engine.batch_register_memory(reg_ptrs, reg_lens)
         except Exception:
             # Mark register as failed
             ret_value = -1

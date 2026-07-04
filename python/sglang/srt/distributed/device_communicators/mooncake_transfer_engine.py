@@ -3,7 +3,11 @@ import logging
 import os
 from typing import Dict, List, Optional, Union
 
-from sglang.srt.disaggregation.npu_ipc_utils import log_ipc_regions
+from sglang.srt.disaggregation.npu_ipc_utils import (
+    align_npu_ipc_regions,
+    log_ipc_regions,
+    needs_npu_ipc_alignment,
+)
 from sglang.srt.environ import envs
 from sglang.srt.utils.network import NetworkAddress, get_free_port
 
@@ -140,8 +144,12 @@ class MooncakeTransferEngine:
             [length],
             [name or f"ptr=0x{ptr:x}"],
         )
+        reg_ptr, reg_len = int(ptr), int(length)
+        if needs_npu_ipc_alignment():
+            reg_ptr, reg_len = align_npu_ipc_regions([ptr], [length])
+            reg_ptr, reg_len = reg_ptr[0], reg_len[0]
         try:
-            ret_value = self.engine.register_memory(ptr, length)
+            ret_value = self.engine.register_memory(reg_ptr, reg_len)
         except Exception:
             # Mark register as failed
             ret_value = -1
@@ -167,8 +175,11 @@ class MooncakeTransferEngine:
     ) -> int:
         """Batch register multiple memory regions."""
         log_ipc_regions("MooncakeTransferEngine.batch_register", ptrs, lengths, names)
+        reg_ptrs, reg_lens = ptrs, lengths
+        if needs_npu_ipc_alignment():
+            reg_ptrs, reg_lens = align_npu_ipc_regions(ptrs, lengths)
         try:
-            ret_value = self.engine.batch_register_memory(ptrs, lengths)
+            ret_value = self.engine.batch_register_memory(reg_ptrs, reg_lens)
         except Exception:
             # Mark batch register as failed
             ret_value = -1
@@ -188,8 +199,12 @@ class MooncakeTransferEngine:
 
     def batch_deregister(self, ptrs: List[int]) -> int:
         """Batch deregister multiple memory regions."""
+        reg_ptrs = ptrs
+        if needs_npu_ipc_alignment() and ptrs:
+            # Deregister the same aligned base addresses used at register time.
+            reg_ptrs, _ = align_npu_ipc_regions(ptrs, [1] * len(ptrs))
         try:
-            ret_value = self.engine.batch_unregister_memory(ptrs)
+            ret_value = self.engine.batch_unregister_memory(reg_ptrs)
         except Exception:
             # Mark batch deregister as failed
             ret_value = -1
