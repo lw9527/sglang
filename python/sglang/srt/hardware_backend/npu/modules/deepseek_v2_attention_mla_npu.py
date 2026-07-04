@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -418,7 +419,13 @@ def forward_dsa_prepare_npu(
             dynamic_scale,
         )
     else:
-        topk_indices = prev_topk_indices
+        topk_indices = maybe_capture_indexer_topk(m.layer_id, prev_topk_indices)
+        if topk_indices is None:
+            raise RuntimeError(
+                f"Layer {m.layer_id} is skip_topk (shared indexer) but "
+                "prev_topk_indices is missing. With PP, ensure topk_indices is "
+                "propagated via PPProxyTensors from the previous PP stage."
+            )
 
     return (
         q_pe,
