@@ -326,39 +326,46 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.custom_mem_pool = None
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # Per-layer allocation: only layer-0 base may be 2MB-aligned in a single
-            # contiguous [layer_num, ...] tensor; HCCL IPC needs ptr+size aligned.
-            page_shape = (
-                self.size // self.page_size + 1,
-                self.page_size,
-                1,
+            # Contiguous [layer, page, ...] layout is required by kernel_ascend
+            # transfer_kv_dim_exchange (page_first_kv_split HiCache). Per-layer
+            # Python lists of separate tensors break that kernel and hang L2 I/O.
+            # Mooncake IPC uses per-layer ptrs from k_buffer[i] via
+            # get_contiguous_buf_infos (see npu_ipc_utils).
+            self.k_buffer = torch.zeros(
+                (
+                    layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    1,
+                    self.kv_lora_rank,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
             )
-            self.k_buffer = [
-                torch.zeros(
-                    (*page_shape, self.kv_lora_rank),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(layer_num)
-            ]
-            self.v_buffer = [
-                torch.zeros(
-                    (*page_shape, self.qk_rope_head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(layer_num)
-            ]
+            self.v_buffer = torch.zeros(
+                (
+                    layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    1,
+                    self.qk_rope_head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
-                self.index_k_buffer = [
-                    torch.zeros(
-                        (*page_shape, self.index_head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(layer_num)
-                ]
+                self.index_k_buffer = torch.zeros(
+                    (
+                        layer_num,
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        1,
+                        self.index_head_dim,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
 
         self._finalize_allocation_log(size)
 
