@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.disaggregation.npu_ipc_utils import log_ipc_regions
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -166,6 +167,14 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 self.get_value_buffer(i)[0].nbytes
                 for i in range(self.start_layer, self.start_layer + self.layer_num)
             ]
+        layers = range(self.start_layer, self.start_layer + self.layer_num)
+        labels = [f"k_layer_{i}" for i in layers] + [f"v_layer_{i}" for i in layers]
+        log_ipc_regions(
+            "NPUMHATokenToKVPool.get_contiguous_buf_infos",
+            kv_data_ptrs,
+            kv_data_lens,
+            labels,
+        )
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def set_kv_buffer(
@@ -431,6 +440,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             kv_item_lens += [
                 self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)
             ]
+        labels = [f"k_layer_{i}" for i in range(self.layer_num)] + [
+            f"v_layer_{i}" for i in range(self.layer_num)
+        ]
+        if self.index_head_dim is not None:
+            labels += [f"index_k_layer_{i}" for i in range(self.layer_num)]
+        log_ipc_regions(
+            "NPUMLATokenToKVPool.get_contiguous_buf_infos",
+            kv_data_ptrs,
+            kv_data_lens,
+            labels,
+        )
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def set_kv_buffer(

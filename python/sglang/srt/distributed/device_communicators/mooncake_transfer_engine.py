@@ -3,6 +3,7 @@ import logging
 import os
 from typing import Dict, List, Optional, Union
 
+from sglang.srt.disaggregation.npu_ipc_utils import log_ipc_regions
 from sglang.srt.environ import envs
 from sglang.srt.utils.network import NetworkAddress, get_free_port
 
@@ -132,7 +133,13 @@ class MooncakeTransferEngine:
             self.hostname, self.engine.get_rpc_port()
         ).to_host_port_str()
 
-    def register(self, ptr, length):
+    def register(self, ptr, length, name: Optional[str] = None):
+        log_ipc_regions(
+            "MooncakeTransferEngine.register",
+            [ptr],
+            [length],
+            [name or f"ptr=0x{ptr:x}"],
+        )
         try:
             ret_value = self.engine.register_memory(ptr, length)
         except Exception:
@@ -152,8 +159,14 @@ class MooncakeTransferEngine:
         if ret_value != 0:
             logger.debug("Mooncake memory deregistration %s failed.", ptr)
 
-    def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
+    def batch_register(
+        self,
+        ptrs: List[int],
+        lengths: List[int],
+        names: Optional[List[str]] = None,
+    ) -> int:
         """Batch register multiple memory regions."""
+        log_ipc_regions("MooncakeTransferEngine.batch_register", ptrs, lengths, names)
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
         except Exception:
@@ -166,7 +179,11 @@ class MooncakeTransferEngine:
                 )
 
         if ret_value != 0:
-            logger.debug("Mooncake batch memory registration failed.")
+            logger.warning(
+                "Mooncake batch memory registration failed (ret=%s). "
+                "Check [NPU IPC align] warnings above for misaligned ptr/size.",
+                ret_value,
+            )
         return ret_value
 
     def batch_deregister(self, ptrs: List[int]) -> int:

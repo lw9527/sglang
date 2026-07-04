@@ -1,9 +1,10 @@
 import logging
 import os
-from typing import List
+from typing import List, Optional
 
 import torch
 
+from sglang.srt.disaggregation.npu_ipc_utils import log_ipc_regions
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
@@ -81,14 +82,25 @@ class AscendTransferEngine(MooncakeTransferEngine):
             logger.error("Ascend Transfer Engine initialization failed.")
             raise RuntimeError("Ascend Transfer Engine initialization failed.")
 
-    def batch_register(self, ptrs: List[int], lengths: List[int]):
+    def batch_register(
+        self,
+        ptrs: List[int],
+        lengths: List[int],
+        names: Optional[List[str]] = None,
+    ):
+        log_ipc_regions("AscendTransferEngine.batch_register", ptrs, lengths, names)
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
         except Exception:
             # Mark register as failed
             ret_value = -1
         if ret_value != 0:
-            logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
+            logger.warning(
+                "Ascend memory registration failed (ret=%s). "
+                "Check [NPU IPC align] warnings above for misaligned ptr/size.",
+                ret_value,
+            )
+        return ret_value
 
     @staticmethod
     def _get_transfer_protocol():

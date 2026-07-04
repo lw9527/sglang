@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.npu_ipc_utils import log_ipc_regions
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
 
@@ -293,6 +294,19 @@ class MetadataBuffers:
             self.output_hidden_states[0].nbytes,
             self.bootstrap_room[0].nbytes,
         ]
+        aux_labels = [
+            "aux.output_ids",
+            "aux.cached_tokens",
+            "aux.output_token_logprobs_val",
+            "aux.output_token_logprobs_idx",
+            "aux.output_top_logprobs_val",
+            "aux.output_top_logprobs_idx",
+            "aux.output_topk_p",
+            "aux.output_topk_index",
+            "aux.output_hidden_states",
+            "aux.bootstrap_room",
+        ]
+        log_ipc_regions("MetadataBuffers.get_buf_infos", ptrs, data_lens, aux_labels)
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
