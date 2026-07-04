@@ -5,6 +5,7 @@ import torch
 import torch_npu
 from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
 
+from sglang.srt.configs.model_config import get_dsa_indexer_source_layer_id
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
@@ -426,6 +427,18 @@ def forward_dsa_prepare_npu(
                 "prev_topk_indices is missing. With PP, ensure topk_indices is "
                 "propagated via PPProxyTensors from the previous PP stage."
             )
+        kv_pool = get_token_to_kv_pool()
+        if hasattr(kv_pool, "mirror_index_k_at_loc"):
+            from sglang.srt.server_args import get_global_server_args
+
+            hf_config = get_global_server_args().get_model_config().hf_config
+            src_layer = get_dsa_indexer_source_layer_id(
+                hf_config, m.layer_id, is_nextn=m.is_nextn
+            )
+            if src_layer != m.layer_id:
+                kv_pool.mirror_index_k_at_loc(
+                    src_layer, m.layer_id, forward_batch.out_cache_loc
+                )
 
     return (
         q_pe,
