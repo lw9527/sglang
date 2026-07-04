@@ -4,9 +4,10 @@ import os
 from typing import Dict, List, Optional, Union
 
 from sglang.srt.disaggregation.npu_ipc_utils import (
-    align_npu_ipc_regions,
+    align_npu_ipc_region,
     log_ipc_regions,
     needs_npu_ipc_alignment,
+    prepare_npu_ipc_register_regions,
 )
 from sglang.srt.environ import envs
 from sglang.srt.utils.network import NetworkAddress, get_free_port
@@ -146,8 +147,7 @@ class MooncakeTransferEngine:
         )
         reg_ptr, reg_len = int(ptr), int(length)
         if needs_npu_ipc_alignment():
-            reg_ptr, reg_len = align_npu_ipc_regions([ptr], [length])
-            reg_ptr, reg_len = reg_ptr[0], reg_len[0]
+            reg_ptr, reg_len = align_npu_ipc_region(int(ptr), int(length))
         try:
             ret_value = self.engine.register_memory(reg_ptr, reg_len)
         except Exception:
@@ -177,7 +177,14 @@ class MooncakeTransferEngine:
         log_ipc_regions("MooncakeTransferEngine.batch_register", ptrs, lengths, names)
         reg_ptrs, reg_lens = ptrs, lengths
         if needs_npu_ipc_alignment():
-            reg_ptrs, reg_lens = align_npu_ipc_regions(ptrs, lengths)
+            reg_ptrs, reg_lens = prepare_npu_ipc_register_regions(ptrs, lengths)
+            if len(reg_ptrs) < len(ptrs):
+                logger.info(
+                    "[NPU IPC align] batch_register: coalesced %d buffers into %d "
+                    "non-overlapping HCCL regions",
+                    len(ptrs),
+                    len(reg_ptrs),
+                )
         try:
             ret_value = self.engine.batch_register_memory(reg_ptrs, reg_lens)
         except Exception:
@@ -197,12 +204,14 @@ class MooncakeTransferEngine:
             )
         return ret_value
 
-    def batch_deregister(self, ptrs: List[int]) -> int:
+    def batch_deregister(
+        self, ptrs: List[int], lengths: Optional[List[int]] = None
+    ) -> int:
         """Batch deregister multiple memory regions."""
         reg_ptrs = ptrs
         if needs_npu_ipc_alignment() and ptrs:
-            # Deregister the same aligned base addresses used at register time.
-            reg_ptrs, _ = align_npu_ipc_regions(ptrs, [1] * len(ptrs))
+            lens = lengths if lengths is not None else [1] * len(ptrs)
+            reg_ptrs, _ = prepare_npu_ipc_register_regions(ptrs, lens)
         try:
             ret_value = self.engine.batch_unregister_memory(reg_ptrs)
         except Exception:

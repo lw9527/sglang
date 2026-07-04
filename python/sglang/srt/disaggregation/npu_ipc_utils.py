@@ -53,6 +53,43 @@ def align_npu_ipc_regions(
     return aligned_ptrs, aligned_lengths
 
 
+def coalesce_npu_ipc_regions(
+    ptrs: Sequence[int], lengths: Sequence[int]
+) -> Tuple[List[int], List[int]]:
+    """Align each buffer then merge overlapping 2MB-padded intervals for HCCL IPC.
+
+    Padding adjacent layers independently causes HCCL overlap errors like:
+    new [0x12d36dc00000, +24MB) overlaps existing [0x12d36c600000, +24MB).
+    """
+    if not ptrs:
+        return [], []
+
+    intervals: List[Tuple[int, int]] = []
+    for ptr, length in zip(ptrs, lengths):
+        ap, al = align_npu_ipc_region(int(ptr), int(length))
+        intervals.append((ap, ap + al))
+
+    intervals.sort(key=lambda item: item[0])
+    merged: List[Tuple[int, int]] = [intervals[0]]
+    for start, end in intervals[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+
+    merged_ptrs = [start for start, _ in merged]
+    merged_lens = [end - start for start, end in merged]
+    return merged_ptrs, merged_lens
+
+
+def prepare_npu_ipc_register_regions(
+    ptrs: Sequence[int], lengths: Sequence[int]
+) -> Tuple[List[int], List[int]]:
+    """Regions to pass to Mooncake/HCCL register_memory (aligned + coalesced)."""
+    return coalesce_npu_ipc_regions(ptrs, lengths)
+
+
 def should_log_npu_ipc_alignment() -> bool:
     if envs.SGLANG_NPU_IPC_ALIGN_DEBUG.get():
         return True

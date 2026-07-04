@@ -278,14 +278,21 @@ class MooncakeKVManager(CommonKVManager):
 
     def deregister_buffer_to_engine(self):
         if self.kv_args.kv_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
+            self.engine.batch_deregister(
+                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
+            )
 
         if self.kv_args.aux_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
+            self.engine.batch_deregister(
+                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
+            )
 
-        for ptrs in self.kv_args.state_data_ptrs or []:
+        for ptrs, lens in zip(
+            self.kv_args.state_data_ptrs or [],
+            self.kv_args.state_data_lens or [],
+        ):
             if ptrs:
-                self.engine.batch_deregister(ptrs)
+                self.engine.batch_deregister(ptrs, lens)
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
