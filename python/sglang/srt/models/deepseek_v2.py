@@ -2511,7 +2511,10 @@ class DeepseekV2Model(nn.Module):
                 "residual": residual,
             }
             if self.use_dsa and topk_indices is not None:
-                proxy_tensors["topk_indices"] = topk_indices
+                if isinstance(topk_indices, tuple):
+                    proxy_tensors["topk_indices"] = torch.cat(topk_indices, dim=0)
+                else:
+                    proxy_tensors["topk_indices"] = topk_indices
             return PPProxyTensors(proxy_tensors)
         else:
             if not forward_batch.forward_mode.is_idle():
