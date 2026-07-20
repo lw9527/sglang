@@ -41,6 +41,10 @@ from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
+# Sentinel key for empty PP proxy transfers. Non-last ranks always send a proxy
+# message each microbatch so the next rank can always post a matching recv.
+_PP_PROXY_EMPTY_KEY = "__pp_proxy_empty__"
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -112,7 +116,7 @@ class SchedulerPPMixin:
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                pp_proxy_tensors = self._pp_recv_proxy_tensors_symmetric(mb_id)
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -124,6 +128,7 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
+                result = None
                 if self.cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
@@ -147,18 +152,12 @@ class SchedulerPPMixin:
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
-                    if self.cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
+                    with torch.profiler.record_function(
+                        "send_proxy_dict_to_next_stage"
+                    ):
+                        self.send_proxy_work = (
+                            self._pp_send_proxy_to_next_stage_symmetric(mb_id, result)
                         )
-                        with torch.profiler.record_function(
-                            "send_proxy_dict_to_next_stage"
-                        ):
-                            self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                                result.pp_hidden_states_proxy_tensors.tensors,
-                                async_send=True,
-                                msg_type="proxy",
-                            )
 
                 self.pp_outputs = next_pp_outputs
 
@@ -254,7 +253,7 @@ class SchedulerPPMixin:
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                pp_proxy_tensors = self._pp_recv_proxy_tensors_symmetric(mb_id)
 
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -264,6 +263,7 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
+                result = None
                 if self.cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
@@ -324,15 +324,9 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
-                    if self.cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=True,
-                            msg_type="proxy",
-                        )
+                    self.send_proxy_work = self._pp_send_proxy_to_next_stage_symmetric(
+                        mb_id, result
+                    )
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -404,9 +398,13 @@ class SchedulerPPMixin:
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = None
-                    if not self.cur_batch.forward_mode.is_prebuilt():
-                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                drained_proxy = self._pp_recv_proxy_tensors_symmetric(mb_id)
+                pp_proxy_tensors = None
+                if (
+                    self.cur_batch is not None
+                    and not self.cur_batch.forward_mode.is_prebuilt()
+                ):
+                    pp_proxy_tensors = drained_proxy
 
                 # early send output if possible
                 if self.server_args.pp_async_batch_depth > 0:
@@ -418,6 +416,7 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
 
+                result = None
                 if self.cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
@@ -507,15 +506,14 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
-                    if self.cur_batch and not self.cur_batch.forward_mode.is_prebuilt():
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=True,
-                            msg_type="proxy",
-                        )
+                    send_real_proxy = (
+                        self.cur_batch is not None
+                        and not self.cur_batch.forward_mode.is_prebuilt()
+                    )
+                    self.send_proxy_work = self._pp_send_proxy_to_next_stage_symmetric(
+                        mb_id,
+                        result if send_real_proxy else None,
+                    )
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -1033,18 +1031,86 @@ class SchedulerPPMixin:
                 )
                 self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
 
-    def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
-        pp_proxy_tensors = None
-        if not self.pp_group.is_first_rank:
-            pp_proxy_tensors = PPProxyTensors(
-                self._pp_recv_typed_dict(
-                    expected_kind="proxy",
-                    all_gather_group=(
-                        self.attn_tp_group if self.require_attn_tp_allgather else None
-                    ),
+    def _pp_is_empty_proxy_tensor_dict(
+        self: Scheduler, tensor_dict: Dict[str, torch.Tensor]
+    ) -> bool:
+        return _PP_PROXY_EMPTY_KEY in tensor_dict
+
+    def _pp_make_empty_proxy_tensor_dict(self: Scheduler) -> Dict[str, torch.Tensor]:
+        return {
+            _PP_PROXY_EMPTY_KEY: torch.tensor(
+                [1], dtype=torch.uint8, device=self.device
+            ),
+        }
+
+    def _pp_recv_proxy_tensors_symmetric(
+        self: Scheduler, mb_id: int
+    ) -> Optional[PPProxyTensors]:
+        """Always recv proxy from the previous PP stage when not first rank.
+
+        The previous rank always posts a matching send each microbatch. This
+        avoids deadlocks where the sender waits on send_proxy_work while the
+        receiver skipped recv because cur_batch was None.
+        """
+        if self.pp_group.is_first_rank:
+            return None
+
+        tensor_dict = self._pp_recv_typed_dict(
+            expected_kind="proxy",
+            all_gather_group=(
+                self.attn_tp_group if self.require_attn_tp_allgather else None
+            ),
+        )
+        is_empty = self._pp_is_empty_proxy_tensor_dict(tensor_dict)
+        has_batch = self.cur_batch is not None
+
+        if is_empty:
+            if has_batch:
+                logger.warning(
+                    "PP proxy asymmetry: pp_rank=%s mb_id=%s has cur_batch but "
+                    "previous stage sent an empty proxy sentinel",
+                    self.ps.pp_rank,
+                    mb_id,
                 )
+            return None
+
+        if not has_batch:
+            logger.warning(
+                "PP proxy asymmetry: pp_rank=%s mb_id=%s drained non-empty proxy "
+                "from previous stage without cur_batch; before the symmetric "
+                "proxy fix this mismatch would deadlock PP communication",
+                self.ps.pp_rank,
+                mb_id,
             )
-        return pp_proxy_tensors
+            return None
+
+        return PPProxyTensors(tensor_dict)
+
+    def _pp_send_proxy_to_next_stage_symmetric(
+        self: Scheduler,
+        mb_id: int,
+        result: Optional[GenerationBatchResult],
+    ) -> List[P2PWork]:
+        """Always send proxy to the next PP stage when not last rank."""
+        if self.pp_group.is_last_rank:
+            return []
+
+        if result is not None and result.pp_hidden_states_proxy_tensors is not None:
+            self.device_module.current_stream().wait_event(self.launch_event)
+            tensors = result.pp_hidden_states_proxy_tensors.tensors
+        else:
+            tensors = self._pp_make_empty_proxy_tensor_dict()
+            logger.debug(
+                "PP proxy symmetric send: pp_rank=%s mb_id=%s sent empty sentinel",
+                self.ps.pp_rank,
+                mb_id,
+            )
+
+        return self._pp_send_dict_to_next_stage(
+            tensors,
+            async_send=True,
+            msg_type="proxy",
+        )
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
