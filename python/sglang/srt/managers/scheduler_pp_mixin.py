@@ -1313,6 +1313,13 @@ class SchedulerPPMixin:
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
+        # Probe: mark the first local WaitingForInput observation on the prefill
+        # bootstrap sender, i.e. the moment the decode handshake landed. This
+        # splits bootstrap_duration into wait_decode (A段) vs consensus (B段).
+        if is_send:
+            for req, poll in zip(req_queue, polls):
+                if poll == KVPoll.WaitingForInput:
+                    req.time_stats.set_bootstrap_waiting_for_input_time()
         rids: List = []
         for poll_statuses in poll_statuses_group:
             rids.append(

@@ -603,6 +603,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     decode_prebuilt_finish_time: float = 0.0
 
     # bootstrap sub-phase tracking (PD disagg)
+    # First time the sender's poll observed KVPoll.WaitingForInput, i.e. the
+    # decode-side handshake (prealloc + transfer_infos) has arrived. Splits the
+    # prefill bootstrap wait into:
+    #   A段 (wait-for-decode): prefill_bootstrap_queue_entry_time -> this
+    #   B段 (PP consensus + forward pacing): this -> bootstrap_done_time
+    bootstrap_waiting_for_input_time: float = 0.0
     bootstrap_done_time: float = 0.0
 
     # only for request tracing
@@ -1011,6 +1017,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 alloc_ms=alloc_ms,
             )
 
+    def set_bootstrap_waiting_for_input_time(self, ts=None):
+        # Idempotent: only the first WaitingForInput observation counts, so the
+        # timestamp marks when the decode handshake actually landed.
+        if self.bootstrap_waiting_for_input_time == 0.0:
+            self.bootstrap_waiting_for_input_time = ts or time.perf_counter()
+
     def set_bootstrap_done_time(self, ts=None):
         ts = ts or time.perf_counter()
         if self.bootstrap_done_time == 0.0:
@@ -1072,9 +1084,24 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     assert (
                         bootstrap_duration >= 0
                     ), f"bootstrap_duration={bootstrap_duration} < 0"
-                bootstrap_fields = (
-                    f"bootstrap_duration={self.format_duration(bootstrap_duration)}, "
-                )
+                # Split bootstrap into A段 (waiting for decode handshake) and
+                # B段 (PP consensus + forward pacing) when the probe fired.
+                if self.bootstrap_waiting_for_input_time > 0:
+                    wait_decode_duration = self.duration_between(
+                        self.prefill_bootstrap_queue_entry_time,
+                        self.bootstrap_waiting_for_input_time,
+                    )
+                    consensus_duration = self.duration_between(
+                        self.bootstrap_waiting_for_input_time,
+                        self.bootstrap_done_time,
+                    )
+                    bootstrap_fields = (
+                        f"bootstrap_duration={self.format_duration(bootstrap_duration)} "
+                        f"(wait_decode={self.format_duration(wait_decode_duration)}, "
+                        f"consensus={self.format_duration(consensus_duration)}), "
+                    )
+                else:
+                    bootstrap_fields = f"bootstrap_duration={self.format_duration(bootstrap_duration)}, "
             elif self.bootstrap_done_time > 0:
                 bootstrap_fields = f"bootstrap_done_time={self.format_wallclock(self.bootstrap_done_time)}, "
             else:
