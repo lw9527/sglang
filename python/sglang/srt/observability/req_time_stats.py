@@ -1126,10 +1126,31 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             else:
                 bootstrap_fields = f"bootstrap_queue_duration={self.format_duration(bootstrap_queue_duration)}, "
 
+            # Prefill-side pure KV send window: from when this req entered the
+            # transfer queue (forward done, send_kv_chunk issued) to when the
+            # prefill sender observed KVPoll.Success. Compare against decode's
+            # kv_arrival: if they match, the wire/RMA is the bottleneck; if this
+            # is short but decode's kv_arrival is long, prefill was late to start
+            # sending (forward not done / bootstrap not ready) rather than slow.
+            if (
+                self.prefill_kv_transfer_finish_time > 0
+                and self.prefill_transfer_queue_entry_time > 0
+            ):
+                kv_send_duration = self.duration_between(
+                    self.prefill_transfer_queue_entry_time,
+                    self.prefill_kv_transfer_finish_time,
+                )
+                kv_send_fields = (
+                    f"kv_send_duration={self.format_duration(kv_send_duration)}, "
+                )
+            else:
+                kv_send_fields = ""
+
             return (
                 f"{bootstrap_fields}"
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
+                f"{kv_send_fields}"
                 f"entry_time={self.format_wallclock(self.prefill_bootstrap_queue_entry_time)}, "
                 f"transfer_speed={self.transfer_speed_gb_s:.2f} GB/s, "
                 f"transfer_total={self.transfer_total_mb:.2f} MB"
