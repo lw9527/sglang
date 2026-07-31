@@ -25,6 +25,10 @@ class TransferKVChunk:
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
     chunk_id: Optional[int] = None
+    # Probe: time.perf_counter() when the chunk was enqueued into the transfer
+    # queue (set by add_transfer_request). Lets the transfer worker measure how
+    # long the chunk waited in queue before a worker thread picked it up.
+    enqueue_ts: float = 0.0
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )

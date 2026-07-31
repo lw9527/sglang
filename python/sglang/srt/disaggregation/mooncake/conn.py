@@ -1380,6 +1380,17 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                # Probe: how long this chunk waited in the transfer queue before a
+                # worker thread picked it up, and when the send work started. Split
+                # the prefill send path into queue_wait / send / notify so the 49s
+                # decode kv_arrival can be attributed to one of them.
+                _probe_pick_ts = time.perf_counter()
+                _probe_queue_wait_ms = (
+                    (_probe_pick_ts - kv_chunk.enqueue_ts) * 1000.0
+                    if kv_chunk.enqueue_ts > 0
+                    else -1.0
+                )
+                _probe_notify_ms = 0.0
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1562,6 +1573,11 @@ class MooncakeKVManager(CommonKVManager):
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
                                 self.update_status(req.room, status)
+                                # Probe: time the ZMQ Success notification to decode.
+                                # This PUSH socket has SNDTIMEO=30s and blocks when
+                                # the decode peer's recv buffer is full, so a large
+                                # value here (not the RMA) explains a late kv_arrival.
+                                _probe_notify_t0 = time.perf_counter()
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
                                         endpoint,
@@ -1570,6 +1586,9 @@ class MooncakeKVManager(CommonKVManager):
                                         status,
                                         prefill_unique_rank,
                                     )
+                                _probe_notify_ms += (
+                                    time.perf_counter() - _probe_notify_t0
+                                ) * 1000.0
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
@@ -1588,6 +1607,21 @@ class MooncakeKVManager(CommonKVManager):
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                         thread_finish_flag=True,
+                    )
+
+                # Probe: on the last chunk, report the send-path breakdown so the
+                # decode-side kv_arrival gap can be pinned to queue_wait (worker
+                # backlog), send (real RMA incl. executor fan-out), or notify (ZMQ
+                # PUSH to a slow decode peer).
+                if kv_chunk.is_last_chunk and not staging_deferred:
+                    _probe_send_ms = (
+                        time.perf_counter() - _probe_pick_ts
+                    ) * 1000.0 - _probe_notify_ms
+                    logger.info(
+                        f"[KV_SEND_PROBE] room={kv_chunk.room} "
+                        f"queue_wait={_probe_queue_wait_ms:.2f}ms "
+                        f"send={_probe_send_ms:.2f}ms "
+                        f"notify={_probe_notify_ms:.2f}ms"
                     )
 
                 if staging_deferred:
@@ -1832,6 +1866,8 @@ class MooncakeKVManager(CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 trace_ctx=trace_ctx,
+                # Probe: stamp enqueue time so the worker can report queue wait.
+                enqueue_ts=time.perf_counter(),
             )
         )
 
