@@ -374,13 +374,18 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     response_sent_to_client_time: float = 0.0
 
     def __getstate__(self) -> object:
-        state = {}
-        # send to DP controller or Scheduler
-        # If necessary, can propagate the timestamp here, for example:
-        # state = {
-        #    "created_time": self.created_time,
-        #    "api_server_dispatch_time": self.api_server_dispatch_time,
-        # }
+        # Propagate the upstream (API-server / tokenizer) timestamps to the
+        # scheduler so the decode node can measure intake latency: the gap
+        # between when the tokenizer dispatched the request over ZMQ
+        # (api_server_dispatch_time) and when the scheduler main loop actually
+        # picked it up (scheduler_recv_time). A large gap means the decode
+        # scheduler loop was starved (blocked on forward / transfer poll), not
+        # that upstream was slow. Field names end in "time", so the base
+        # __setstate__ converts them into the receiver's perf_counter timeline.
+        state = {
+            "created_time": self.created_time,
+            "api_server_dispatch_time": self.api_server_dispatch_time,
+        }
         state.update(super().__getstate__())
         return state
 
@@ -1161,7 +1166,31 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             else:
                 prealloc_fields = f"prealloc_queue_duration={self.format_duration(prealloc_duration)}, "
 
+            # Intake breakdown (probe #1): measure how long the request sat
+            # between being dispatched upstream (decode's tokenizer / API server,
+            # api_server_dispatch_time) and being dequeued by the decode
+            # scheduler main loop (scheduler_recv_time), then how long from there
+            # to prealloc-queue admission. recv->prealloc runs in the same event
+            # loop iteration so it should be ~0; a large dispatch->recv gap means
+            # the decode scheduler loop was starved (head-of-line blocked on
+            # forward / transfer poll), not that upstream was slow to send.
+            if self.api_server_dispatch_time > 0 or self.scheduler_recv_time > 0:
+                dispatch_to_recv = self.duration_between(
+                    self.api_server_dispatch_time, self.scheduler_recv_time
+                )
+                recv_to_prealloc = self.duration_between(
+                    self.scheduler_recv_time, self.decode_prealloc_queue_entry_time
+                )
+                intake_fields = (
+                    f"intake_dispatch_to_recv={self.format_duration(dispatch_to_recv)}, "
+                    f"intake_recv_to_prealloc={self.format_duration(recv_to_prealloc)}, "
+                    f"dispatch_time={self.format_wallclock(self.api_server_dispatch_time)}, "
+                )
+            else:
+                intake_fields = ""
+
             return (
+                f"{intake_fields}"
                 f"{prealloc_fields}"
                 f"transfer_duration={self.format_duration(transfer_duration)}, "
                 f"queue_duration={self.format_duration(queue_duration)}, "
