@@ -1922,6 +1922,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
+                # Probe: KV RMA has landed in device buffer. Mark it before the
+                # hicache-restore gate and the commit, so transfer_duration can be
+                # split into kv_arrival (up to here) vs commit_lag (decode consume).
+                decode_req.req.time_stats.set_decode_kv_arrival_time()
                 if (
                     self.scheduler.enable_decode_hicache
                     and hicache_restore_status == HiCacheRestoreResult.PENDING

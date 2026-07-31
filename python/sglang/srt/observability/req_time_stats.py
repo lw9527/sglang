@@ -605,6 +605,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # decode node, get by time.perf_counter()
     decode_prealloc_queue_entry_time: float = 0.0
     decode_transfer_queue_entry_time: float = 0.0
+    # First time the decode receiver's poll observed KVPoll.Success, i.e. the KV
+    # data has actually landed in decode's device buffer. Splits the decode
+    # transfer_duration into:
+    #   kv_arrival (real RMA + sender-side start): decode_transfer_queue_entry_time -> this
+    #   commit_lag (decode consume/poll delay): this -> wait_queue_entry_time
+    decode_kv_arrival_time: float = 0.0
     decode_prebuilt_finish_time: float = 0.0
 
     # bootstrap sub-phase tracking (PD disagg)
@@ -1033,6 +1039,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if self.bootstrap_done_time == 0.0:
             self.bootstrap_done_time = ts
 
+    def set_decode_kv_arrival_time(self, ts=None):
+        # Idempotent: only the first KVPoll.Success observation counts, marking
+        # when the KV data actually landed in decode's device buffer (before the
+        # metadata-buffer commit). Splits transfer_duration into kv_arrival vs
+        # commit_lag so we can tell "KV transfer slow" from "decode consume slow".
+        if self.decode_kv_arrival_time == 0.0:
+            self.decode_kv_arrival_time = ts or time.perf_counter()
+
     def set_decode_prebuilt_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
         self.decode_prebuilt_finish_time = ts
@@ -1189,10 +1203,34 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             else:
                 intake_fields = ""
 
+            # Transfer breakdown (probe #2): split transfer_duration at the first
+            # KVPoll.Success observation. kv_arrival = transfer-queue admission ->
+            # KV landed in device buffer (real RMA + prefill-side start pacing);
+            # commit_lag = KV landed -> decode consumed it into the metadata
+            # buffer. A large kv_arrival means the KV transfer itself is slow;
+            # a large commit_lag means the transfer finished but the decode loop
+            # was slow to poll/commit it (head-of-line blocked or hicache restore).
+            if self.decode_kv_arrival_time > 0:
+                kv_arrival_duration = self.duration_between(
+                    self.decode_transfer_queue_entry_time, self.decode_kv_arrival_time
+                )
+                commit_lag_duration = self.duration_between(
+                    self.decode_kv_arrival_time, self.wait_queue_entry_time
+                )
+                transfer_fields = (
+                    f"transfer_duration={self.format_duration(transfer_duration)} "
+                    f"(kv_arrival={self.format_duration(kv_arrival_duration)}, "
+                    f"commit_lag={self.format_duration(commit_lag_duration)}), "
+                )
+            else:
+                transfer_fields = (
+                    f"transfer_duration={self.format_duration(transfer_duration)}, "
+                )
+
             return (
                 f"{intake_fields}"
                 f"{prealloc_fields}"
-                f"transfer_duration={self.format_duration(transfer_duration)}, "
+                f"{transfer_fields}"
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
                 f"entry_time={self.format_wallclock(self.decode_prealloc_queue_entry_time)}"
