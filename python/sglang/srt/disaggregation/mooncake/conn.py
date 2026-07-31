@@ -251,7 +251,16 @@ class MooncakeKVManager(CommonKVManager):
                 self._init_staging_allocator()
                 self._staging_handler = None
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
+            # Probe (A+B): measure raw ZMQ round-trip latency and cross-node clock
+            # skew to prefill over the SAME bootstrap sockets that gate wait_decode
+            # (decode->prefill) and Success delivery (prefill->decode). A small RTT
+            # here while wait_decode/kv_arrival stays large means the ZMQ line is
+            # not the bottleneck; a large RTT flags a blocked peer recv thread.
+            self._probe_prefill_endpoints = {}  # tcp endpoint -> is_ipv6
+            self._probe_endpoints_lock = threading.Lock()
+            self._probe_ping_seq = 0
             self.start_decode_thread()
+            self._start_probe_ping_thread()
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -1655,6 +1664,33 @@ class MooncakeKVManager(CommonKVManager):
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
                 room = waiting_req_bytes[0].decode("ascii")
+                # Probe (A+B): decode->prefill PING over the bootstrap recv thread.
+                # Echo it straight back with our recv wallclock so decode can
+                # compute RTT and cross-node clock skew. Because this runs in the
+                # SAME loop that consumes transfer_infos (which gates wait_decode),
+                # a high RTT here means this thread is head-of-line blocked.
+                if room == "PROBE_PING":
+                    # [PROBE_PING, seq, decode_ip, decode_port, t_send_perf, t_send_wall]
+                    seq = waiting_req_bytes[1]
+                    decode_ip = waiting_req_bytes[2].decode("ascii")
+                    decode_port = int(waiting_req_bytes[3].decode("ascii"))
+                    t_send_perf = waiting_req_bytes[4]
+                    t_send_wall = waiting_req_bytes[5]
+                    prefill_recv_wall = repr(time.time()).encode("ascii")
+                    try:
+                        na = NetworkAddress(decode_ip, decode_port)
+                        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+                            [
+                                b"PROBE_PONG",
+                                seq,
+                                t_send_perf,
+                                t_send_wall,
+                                prefill_recv_wall,
+                            ]
+                        )
+                    except Exception as e:
+                        logger.debug(f"Failed to send PROBE_PONG: {e}")
+                    continue
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
                     from sglang.srt.disaggregation.common.staging_handler import (
@@ -1755,6 +1791,27 @@ class MooncakeKVManager(CommonKVManager):
                     self._handle_aux_data(msg)
                     continue
 
+                # Probe (A+B): PONG returned by prefill's bootstrap thread.
+                # [PROBE_PONG, seq, t_send_perf, t_send_wall, prefill_recv_wall]
+                if msg[0] == b"PROBE_PONG":
+                    now_perf = time.perf_counter()
+                    now_wall = time.time()
+                    seq = int(msg[1].decode("ascii"))
+                    t_send_perf = float(msg[2].decode("ascii"))
+                    t_send_wall = float(msg[3].decode("ascii"))
+                    prefill_recv_wall = float(msg[4].decode("ascii"))
+                    rtt_ms = (now_perf - t_send_perf) * 1000.0
+                    # One-way ~= RTT/2. skew = prefill_wall - decode_midpoint_wall.
+                    # Positive skew => prefill clock ahead of decode.
+                    decode_mid_wall = (t_send_wall + now_wall) / 2.0
+                    skew_ms = (prefill_recv_wall - decode_mid_wall) * 1000.0
+                    logger.info(
+                        f"[PROBE_ZMQ_RTT] seq={seq} rtt={rtt_ms:.2f}ms "
+                        f"one_way~={rtt_ms / 2:.2f}ms clock_skew={skew_ms:.2f}ms "
+                        f"(prefill_ahead_of_decode)"
+                    )
+                    continue
+
                 # Staging: prefill notifies a chunk written to staging buffer
                 if msg[0] == b"CHUNK_READY":
                     room = int(msg[1].decode("ascii"))
@@ -1818,6 +1875,34 @@ class MooncakeKVManager(CommonKVManager):
 
         threading.Thread(target=decode_thread).start()
         self._start_heartbeat_checker_thread()
+
+    def _start_probe_ping_thread(self):
+        """Probe (A+B): periodically PING every known prefill rank over the
+        bootstrap PUSH socket and log RTT + clock skew from the PONG. Runs on
+        decode; endpoints are populated lazily by send_metadata."""
+
+        def ping_loop():
+            while True:
+                time.sleep(2.0)
+                with self._probe_endpoints_lock:
+                    endpoints = dict(self._probe_prefill_endpoints)
+                for endpoint, is_ipv6 in endpoints.items():
+                    self._probe_ping_seq += 1
+                    try:
+                        self._connect(endpoint, is_ipv6=is_ipv6).send_multipart(
+                            [
+                                b"PROBE_PING",
+                                str(self._probe_ping_seq).encode("ascii"),
+                                self.local_ip.encode("ascii"),
+                                str(self.rank_port).encode("ascii"),
+                                repr(time.perf_counter()).encode("ascii"),
+                                repr(time.time()).encode("ascii"),
+                            ]
+                        )
+                    except Exception as e:
+                        logger.debug(f"Failed to send PROBE_PING to {endpoint}: {e}")
+
+        threading.Thread(target=ping_loop, daemon=True).start()
 
     def add_transfer_request(
         self,
@@ -2142,6 +2227,16 @@ class MooncakeKVReceiver(CommonKVReceiver):
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
+            # Probe (A+B): remember this prefill rank's ZMQ endpoint so the ping
+            # thread can measure RTT/clock-skew over the same bootstrap socket.
+            _probe_eps = getattr(self.kv_mgr, "_probe_prefill_endpoints", None)
+            if _probe_eps is not None:
+                _rank_ip = bootstrap_info.get("rank_ip")
+                _rank_port = bootstrap_info.get("rank_port")
+                if _rank_ip and _rank_port:
+                    _probe_na = NetworkAddress(_rank_ip, int(_rank_port))
+                    with self.kv_mgr._probe_endpoints_lock:
+                        _probe_eps[_probe_na.to_tcp()] = _probe_na.is_ipv6
             try:
                 with lock:
                     sock.send_multipart(
