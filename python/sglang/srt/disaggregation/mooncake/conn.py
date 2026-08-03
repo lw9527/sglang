@@ -264,6 +264,12 @@ class MooncakeKVManager(CommonKVManager):
             # main loop reads this at kv_arrival time; the delta is the pure
             # main-loop head-of-line gap (status ready -> main loop polled it).
             self._probe_success_collect_ts = {}  # room -> perf_counter
+            # Probe 3: KV RMA arrival window. room -> wallclock of the FIRST prefill
+            # Success (window start). Paired with the LAST Success wallclock, it
+            # bounds when the KV transfer was live on the HCCL fabric. Aligning that
+            # window against [PROBE_BARRIER] arrive_wall confirms/refutes whether the
+            # KV RMA starves the dp-attention all_gather.
+            self._probe_kv_arrival_window = {}  # room -> wallclock (first Success)
             self.start_decode_thread()
             self._start_probe_ping_thread()
 
@@ -1864,6 +1870,10 @@ class MooncakeKVManager(CommonKVManager):
                         arrived_response_num = len(
                             self.prefill_response_tracker[bootstrap_room]
                         )
+                        # Probe 3: stamp the FIRST prefill Success wallclock as the
+                        # KV RMA window start.
+                        if arrived_response_num == 1:
+                            self._probe_kv_arrival_window[bootstrap_room] = time.time()
                         if arrived_response_num == expected_response_num:
                             if self.enable_staging:
                                 handler = self._staging_handler
@@ -1875,6 +1885,21 @@ class MooncakeKVManager(CommonKVManager):
                             self._probe_success_collect_ts[bootstrap_room] = (
                                 time.perf_counter()
                             )
+                            # Probe 3: KV RMA window end. Log [first, last] so it can
+                            # be aligned against [PROBE_BARRIER] arrive_wall.
+                            _win_start = self._probe_kv_arrival_window.pop(
+                                bootstrap_room, None
+                            )
+                            if _win_start is not None:
+                                _win_now = time.time()
+                                logger.info(
+                                    "[PROBE_KV_WINDOW] room=%s first_success_wall=%.3f "
+                                    "last_success_wall=%.3f span=%.1fms",
+                                    bootstrap_room,
+                                    _win_start,
+                                    _win_now,
+                                    (_win_now - _win_start) * 1000.0,
+                                )
                             self.update_status(bootstrap_room, KVPoll.Success)
                 elif status == KVPoll.Failed:
                     self.record_failure(

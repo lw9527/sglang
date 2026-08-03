@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -34,7 +36,15 @@ if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 
+logger = logging.getLogger(__name__)
+
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+
+# Probe: log the dp-attention lockstep barrier breakdown only when it is slow,
+# so we can separate "all_gather itself is slow" (network/HCCL contention, e.g.
+# a concurrent mooncake KV RMA saturating the fabric) from "this rank arrived
+# late" (main-thread stall before the collective). Threshold in ms.
+_PROBE_BARRIER_SLOW_MS = 500.0
 
 
 def _resolve_elastic_world_dp_size(
@@ -314,11 +324,33 @@ def prepare_mlp_sync_batch_raw(
     )
 
     if not skip_all_gather:
+        # Probe 1+2: split the lockstep barrier.
+        #   _p_arrive_wall = wallclock this rank REACHED the collective (cross-node
+        #     comparable, clock skew ~0). The rank with the largest arrival time is
+        #     the straggler that stalled before the barrier.
+        #   _p_ag_ms = wall time of all_gather ITSELF. If ~all ranks report a large
+        #     _p_ag_ms with near-identical arrival times -> the collective/network
+        #     is the bottleneck (HCCL fabric contention, e.g. concurrent KV RMA),
+        #     not a single late rank.
+        _p_arrive_wall = time.time()
+        _p_ag_t0 = time.perf_counter()
         mlp_sync_info.all_gather(
             device=device,
             group=group,
             use_all_reduce=use_world_group,
         )
+        _p_ag_ms = (time.perf_counter() - _p_ag_t0) * 1000.0
+        if _p_ag_ms >= _PROBE_BARRIER_SLOW_MS:
+            _p_rank = getattr(tp_group, "rank_in_group", getattr(tp_group, "rank", -1))
+            logger.info(
+                "[PROBE_BARRIER] rank=%s arrive_wall=%.3f all_gather=%.1fms "
+                "num_tokens=%d device=%s",
+                _p_rank,
+                _p_arrive_wall,
+                _p_ag_ms,
+                num_tokens,
+                device,
+            )
 
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
