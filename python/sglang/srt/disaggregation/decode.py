@@ -2048,17 +2048,28 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            # Probe: per-loop-step segmented heartbeat. dp-attention (dp_size>1)
+            # makes every step a lockstep all_gather barrier across all DP ranks;
+            # a single slow rank stalls the whole ring, which shows up as a large
+            # t_sync (barrier wait) or t_fwd (this rank's forward). Log a breakdown
+            # only when a step is slow, so a saturated main loop is attributable.
+            _p_t0 = time.perf_counter()
+            self._probe_mlp_sync_ms = 0.0
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+            _p_t_recv = time.perf_counter()
             self.process_decode_queue()
+            _p_t_queue = time.perf_counter()
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
                 running_batch=self.running_batch
             )
+            _p_t_getbatch = time.perf_counter()
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             batch = self.ngram_embedding_manager.prepare_for_forward(
@@ -2080,6 +2091,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+            _p_t_fwd = time.perf_counter()
 
             # Process the last batch
             if self.last_batch:
@@ -2091,6 +2103,24 @@ class SchedulerDisaggregationDecodeMixin:
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result, batch)
+            _p_t_end = time.perf_counter()
+
+            _p_total_ms = (_p_t_end - _p_t0) * 1000.0
+            if _p_total_ms >= 500.0:
+                logger.info(
+                    "[PROBE_LOOP_HB] total=%.1fms recv=%.1f queue=%.1f "
+                    "getbatch=%.1f(sync=%.1f) fwd=%.1f proc=%.1f "
+                    "batch=%s running=%d",
+                    _p_total_ms,
+                    (_p_t_recv - _p_t0) * 1000.0,
+                    (_p_t_queue - _p_t_recv) * 1000.0,
+                    (_p_t_getbatch - _p_t_queue) * 1000.0,
+                    self._probe_mlp_sync_ms,
+                    (_p_t_fwd - _p_t_getbatch) * 1000.0,
+                    (_p_t_end - _p_t_fwd) * 1000.0,
+                    None if batch is None else batch.forward_mode,
+                    self.running_batch.batch_size() if self.running_batch else 0,
+                )
 
             # Update last_batch
             self.last_batch = batch
@@ -2134,7 +2164,14 @@ class SchedulerDisaggregationDecodeMixin:
             running_batch = self.update_running_batch(running_batch)
             ret = running_batch if not running_batch.is_empty() else None
 
+        # Probe: isolate the dp-attention lockstep all_gather barrier. Under
+        # dp_size>1 this is a cross-DP-rank sync; its wall time is dominated by
+        # the slowest rank reaching the barrier, so it is the prime suspect for
+        # the main-loop HOL. Recorded into _probe_mlp_sync_ms, read by the
+        # [PROBE_LOOP_HB] heartbeat in event_loop_overlap_disagg_decode.
+        _p_sync_t0 = time.perf_counter()
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
+        self._probe_mlp_sync_ms = (time.perf_counter() - _p_sync_t0) * 1000.0
         if ret:
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
