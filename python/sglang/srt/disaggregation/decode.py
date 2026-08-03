@@ -1452,7 +1452,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             num_to_evict = (
                 required_alloc_tokens - self.token_to_kv_pool_allocator.available_size()
             )
+            # PROBE_EVICT: radix eviction can free a large subtree; time it since
+            # it is the heaviest synchronous op inside _pre_alloc for big requests.
+            _ev_t0 = time.perf_counter()
             result = self.tree_cache.evict(EvictParams(num_tokens=num_to_evict))
+            _ev_ms = (time.perf_counter() - _ev_t0) * 1000.0
+            if _ev_ms >= 200.0:
+                logger.info(
+                    "[PROBE_EVICT] rank=%s evict=%.1fms num_to_evict=%d "
+                    "fill_len=%d prefix_len=%d req=%s",
+                    getattr(self, "_probe_rank_tag", None)
+                    or "dp%s/tp%s"
+                    % (
+                        getattr(getattr(self, "ps", None), "attn_dp_rank", "?"),
+                        getattr(self, "tp_rank", "?"),
+                    ),
+                    _ev_ms,
+                    num_to_evict,
+                    fill_len,
+                    prefix_len,
+                    req.rid,
+                )
             if self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens:
                 logger.warning(
                     f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
@@ -2302,17 +2322,30 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
+        # PROBE_PDQ: per-segment timing of the decode-queue local work. For
+        # output=1 there is no decode forward, so any >Ns barrier stall must come
+        # from local work here (KV prealloc for 32k / HiCache restore / KV poll).
+        # This runs BEFORE the mlp_sync all_gather, so the rank whose PROBE_PDQ is
+        # largest is the culprit that makes the other 31 ranks report a big sync.
+        _pq_t0 = time.perf_counter()
+        _pq_hievt_ms = _pq_resume_ms = _pq_prealloc_ms = _pq_transfer_ms = 0.0
+
         if self.enable_decode_hicache:
+            _pq_t = time.perf_counter()
             self.tree_cache.check_hicache_events()
+            _pq_hievt_ms = (time.perf_counter() - _pq_t) * 1000.0
 
         if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
+        _pq_t = time.perf_counter()
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
+        _pq_resume_ms = (time.perf_counter() - _pq_t) * 1000.0
         self.waiting_queue.extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
+            self._probe_pdq_emit(_pq_t0, _pq_hievt_ms, _pq_resume_ms, 0.0, 0.0, -1, -1)
             return
 
         if not hasattr(self, "polling_count"):
@@ -2323,14 +2356,76 @@ class SchedulerDisaggregationDecodeMixin:
 
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
+        _pq_npre = _pq_ntran = 0
         if self.polling_count % self.polling_interval == 0:
+            _pq_t = time.perf_counter()
             req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+            _pq_prealloc_ms = (time.perf_counter() - _pq_t) * 1000.0
+            _pq_npre = len(req_conns)
             self.disagg_decode_transfer_queue.extend(req_conns)
+            _pq_t = time.perf_counter()
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
+            _pq_transfer_ms = (time.perf_counter() - _pq_t) * 1000.0
+            _pq_ntran = len(transferred_reqs)
             if self.enable_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(transferred_reqs)
+
+        self._probe_pdq_emit(
+            _pq_t0,
+            _pq_hievt_ms,
+            _pq_resume_ms,
+            _pq_prealloc_ms,
+            _pq_transfer_ms,
+            _pq_npre,
+            _pq_ntran,
+        )
+
+    def _probe_pdq_emit(
+        self: Scheduler,
+        t0: float,
+        hievt_ms: float,
+        resume_ms: float,
+        prealloc_ms: float,
+        transfer_ms: float,
+        npre: int,
+        ntran: int,
+    ):
+        # Emit a PROBE_PDQ line only when the queue work is heavy (>=500ms), so the
+        # log stays quiet in steady state and flags exactly the stalling iteration.
+        _pq_total_ms = (time.perf_counter() - t0) * 1000.0
+        if _pq_total_ms < 500.0:
+            return
+        _pq_rank = getattr(self, "_probe_rank_tag", None)
+        if _pq_rank is None:
+            _pq_rank = "dp%s/tp%s" % (
+                getattr(getattr(self, "ps", None), "attn_dp_rank", "?"),
+                getattr(self, "tp_rank", "?"),
+            )
+            self._probe_rank_tag = _pq_rank
+        # identify worst sub-segment
+        _pq_segs = {
+            "hievt": hievt_ms,
+            "resume": resume_ms,
+            "prealloc": prealloc_ms,
+            "transfer": transfer_ms,
+        }
+        _pq_worst = max(_pq_segs, key=_pq_segs.get)
+        logger.info(
+            "[PROBE_PDQ] rank=%s enter_wall=%.3f total=%.1fms worst=%s "
+            "hievt=%.1f resume=%.1f prealloc=%.1f transfer=%.1f npre=%d ntran=%d",
+            _pq_rank,
+            time.time(),
+            _pq_total_ms,
+            _pq_worst,
+            hievt_ms,
+            resume_ms,
+            prealloc_ms,
+            transfer_ms,
+            npre,
+            ntran,
+        )
