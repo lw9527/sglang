@@ -2106,20 +2106,76 @@ class SchedulerDisaggregationDecodeMixin:
             _p_t_end = time.perf_counter()
 
             _p_total_ms = (_p_t_end - _p_t0) * 1000.0
+            _p_recv_ms = (_p_t_recv - _p_t0) * 1000.0
+            _p_queue_ms = (_p_t_queue - _p_t_recv) * 1000.0
+            _p_getbatch_ms = (_p_t_getbatch - _p_t_queue) * 1000.0
+            _p_fwd_ms = (_p_t_fwd - _p_t_getbatch) * 1000.0
+            _p_proc_ms = (_p_t_end - _p_t_fwd) * 1000.0
+            # getbatch minus the mlp_sync all_gather wait = this rank's LOCAL
+            # batch-prep work (prealloc/update_running_batch), not a barrier wait.
+            _p_getbatch_nosync_ms = _p_getbatch_ms - self._probe_mlp_sync_ms
+            _p_rank = getattr(self, "_probe_rank_tag", None)
+            if _p_rank is None:
+                _p_rank = "dp%s/tp%s" % (
+                    getattr(self.ps, "attn_dp_rank", "?"),
+                    getattr(self.ps, "tp_rank", "?"),
+                )
+                self._probe_rank_tag = _p_rank
             if _p_total_ms >= 500.0:
                 logger.info(
-                    "[PROBE_LOOP_HB] total=%.1fms recv=%.1f queue=%.1f "
+                    "[PROBE_LOOP_HB] rank=%s total=%.1fms recv=%.1f queue=%.1f "
                     "getbatch=%.1f(sync=%.1f) fwd=%.1f proc=%.1f "
                     "batch=%s running=%d",
+                    _p_rank,
                     _p_total_ms,
-                    (_p_t_recv - _p_t0) * 1000.0,
-                    (_p_t_queue - _p_t_recv) * 1000.0,
-                    (_p_t_getbatch - _p_t_queue) * 1000.0,
+                    _p_recv_ms,
+                    _p_queue_ms,
+                    _p_getbatch_ms,
                     self._probe_mlp_sync_ms,
-                    (_p_t_fwd - _p_t_getbatch) * 1000.0,
-                    (_p_t_end - _p_t_fwd) * 1000.0,
+                    _p_fwd_ms,
+                    _p_proc_ms,
                     None if batch is None else batch.forward_mode,
                     self.running_batch.batch_size() if self.running_batch else 0,
+                )
+
+            # Probe: attribute the straggler. The dp-attention gloo barriers
+            # (recv-broadcast + getbatch mlp_sync) make one rank's LOCAL work
+            # stall all 32 ranks at the next barrier. So the rank to blame is the
+            # one whose local work (queue / fwd / getbatch-minus-sync) is large,
+            # NOT the ranks reporting large recv/sync (those are waiting on it).
+            # Fire on local-work spikes and dump rank + token count to tell 32k
+            # first-step compute apart from HiCache L2->L1 restore (queue) vs
+            # prealloc (getbatch-nosync).
+            _p_local_max = max(_p_queue_ms, _p_fwd_ms, _p_getbatch_nosync_ms)
+            if _p_local_max >= 2000.0:
+                _p_seg = (
+                    "fwd"
+                    if _p_fwd_ms == _p_local_max
+                    else "queue" if _p_queue_ms == _p_local_max else "getbatch_nosync"
+                )
+                _p_ntok = -1
+                try:
+                    if (
+                        batch is not None
+                        and getattr(batch, "seq_lens", None) is not None
+                    ):
+                        _p_ntok = int(batch.seq_lens.sum().item())
+                except Exception:
+                    _p_ntok = -1
+                logger.info(
+                    "[PROBE_STRAGGLER] rank=%s worst_seg=%s local_max=%.1fms "
+                    "queue=%.1f fwd=%.1f getbatch_nosync=%.1f sync=%.1f "
+                    "batch=%s bs=%d ntok=%d",
+                    _p_rank,
+                    _p_seg,
+                    _p_local_max,
+                    _p_queue_ms,
+                    _p_fwd_ms,
+                    _p_getbatch_nosync_ms,
+                    self._probe_mlp_sync_ms,
+                    None if batch is None else batch.forward_mode,
+                    batch.batch_size() if batch is not None else 0,
+                    _p_ntok,
                 )
 
             # Update last_batch
