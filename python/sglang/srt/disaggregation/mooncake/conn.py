@@ -259,6 +259,11 @@ class MooncakeKVManager(CommonKVManager):
             self._probe_prefill_endpoints = {}  # tcp endpoint -> is_ipv6
             self._probe_endpoints_lock = threading.Lock()
             self._probe_ping_seq = 0
+            # Probe: perf_counter stamp of the moment decode_thread collected the
+            # LAST Success for a room (status flipped to Success). The scheduler
+            # main loop reads this at kv_arrival time; the delta is the pure
+            # main-loop head-of-line gap (status ready -> main loop polled it).
+            self._probe_success_collect_ts = {}  # room -> perf_counter
             self.start_decode_thread()
             self._start_probe_ping_thread()
 
@@ -1865,6 +1870,11 @@ class MooncakeKVManager(CommonKVManager):
                                 if handler.is_staging_room(bootstrap_room):
                                     handler.submit_last_scatter_async(bootstrap_room)
                                 self._chunk_writer_counts.pop(bootstrap_room, None)
+                            # Probe: stamp the instant status becomes Success, so
+                            # the main loop can measure how long it took to poll it.
+                            self._probe_success_collect_ts[bootstrap_room] = (
+                                time.perf_counter()
+                            )
                             self.update_status(bootstrap_room, KVPoll.Success)
                 elif status == KVPoll.Failed:
                     self.record_failure(

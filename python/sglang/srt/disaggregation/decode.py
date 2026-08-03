@@ -1926,6 +1926,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 # hicache-restore gate and the commit, so transfer_duration can be
                 # split into kv_arrival (up to here) vs commit_lag (decode consume).
                 decode_req.req.time_stats.set_decode_kv_arrival_time()
+                # Probe: measure the decode SCHEDULER MAIN-LOOP head-of-line gap.
+                # decode_thread flips status to Success and stamps _probe_success
+                # _collect_ts; this branch runs in the main loop on the next poll.
+                # A large delta means the main loop was busy (forward/other polls)
+                # and did not observe the ready status promptly — NOT a wire issue.
+                _mgr = getattr(decode_req.kv_receiver, "kv_mgr", None)
+                _collect_map = getattr(_mgr, "_probe_success_collect_ts", None)
+                if _collect_map is not None:
+                    _collect_ts = _collect_map.pop(decode_req.req.bootstrap_room, None)
+                    if _collect_ts is not None:
+                        _hol_ms = (time.perf_counter() - _collect_ts) * 1000.0
+                        logger.info(
+                            f"[PROBE_MAINLOOP_HOL] rid={decode_req.req.rid} "
+                            f"room={decode_req.req.bootstrap_room} "
+                            f"status_ready_to_poll={_hol_ms:.2f}ms"
+                        )
                 if (
                     self.scheduler.enable_decode_hicache
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
