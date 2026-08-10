@@ -1459,6 +1459,17 @@ class SchedulerPPMixin:
             released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
                 release_rids
             )
+
+            # [PD-LIFECYCLE] Track when decode starts processing transferred requests
+            import time
+
+            from sglang.srt.observability.req_time_stats import DisaggregationMode
+
+            ts = time.perf_counter()
+            for req in released_reqs:
+                if req.time_stats.disagg_mode == DisaggregationMode.DECODE:
+                    req.time_stats.decode_process_start_time = ts
+
             if self.enable_hisparse:
                 for req in released_reqs:
                     self.hisparse_coordinator.admit_request_direct(req)

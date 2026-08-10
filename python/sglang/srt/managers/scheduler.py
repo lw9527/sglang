@@ -3055,6 +3055,20 @@ class Scheduler(
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
 
+        # [PD-LIFECYCLE] Track when prefill compute starts for disagg prefill requests
+        import time
+
+        from sglang.srt.observability.req_time_stats import DisaggregationMode
+
+        if (
+            self.server_args.disaggregation_mode == "prefill"
+            and batch.forward_mode.is_extend()
+        ):
+            ts = time.perf_counter()
+            for req in batch.reqs:
+                if req.time_stats.disagg_mode == DisaggregationMode.PREFILL:
+                    req.time_stats.prefill_compute_start_time = ts
+
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
 

@@ -653,6 +653,19 @@ class SchedulerBatchResultProcessor:
             self._maybe_update_reasoning_tokens(req, next_token_id)
 
             req.time_stats.set_last_decode_finish_time()
+
+            # [PD-LIFECYCLE] Track when decode finishes processing this request
+            if (
+                req.time_stats.disagg_mode
+                == req.time_stats.disagg_mode.__class__.DECODE
+            ):
+                import time
+
+                req.time_stats.decode_process_end_time = time.perf_counter()
+                # Log complete lifecycle if all timestamps are collected
+                if req.time_stats.decode_send_bootstrap_time > 0:
+                    req.time_stats.log_pd_disagg_lifecycle(req.rid, logger)
+
             req.update_finish_state(new_accepted_len)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)

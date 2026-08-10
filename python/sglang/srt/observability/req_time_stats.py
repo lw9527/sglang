@@ -600,6 +600,27 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # bootstrap sub-phase tracking (PD disagg)
     bootstrap_done_time: float = 0.0
 
+    # Detailed PD-disagg lifecycle timestamps
+    # Decode side
+    decode_send_bootstrap_time: float = (
+        0.0  # When decode sends bootstrap metadata to prefill
+    )
+    decode_kv_ready_recv_time: float = 0.0  # When decode receives KV-ready notification
+    decode_process_start_time: float = 0.0  # When decode starts processing this request
+    decode_process_end_time: float = 0.0  # When decode finishes processing
+
+    # Prefill side
+    prefill_recv_bootstrap_time: float = (
+        0.0  # When prefill receives bootstrap from decode
+    )
+    prefill_compute_start_time: float = 0.0  # When prefill starts forward computation
+    prefill_compute_end_time: float = 0.0  # When prefill finishes computation
+    prefill_kv_send_start_time: float = 0.0  # When prefill starts KV RDMA transfer
+    prefill_kv_send_end_time: float = 0.0  # When prefill finishes KV RDMA transfer
+    prefill_notify_send_time: float = (
+        0.0  # When prefill sends completion notification to decode
+    )
+
     # only for request tracing
     scheduler_recv_time: float = 0.0
     last_chunked_prefill_finish_time: float = 0.0
@@ -1183,6 +1204,40 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     @staticmethod
     def format_wallclock(perf_counter_time: float) -> str:
         return f"{convert_time_to_realtime(perf_counter_time):.3f}"
+
+    def log_pd_disagg_lifecycle(self, req_id: str, logger):
+        """Log complete PD-disagg lifecycle timestamps for detailed tracing."""
+        if self.disagg_mode == DisaggregationMode.NULL:
+            return
+
+        def fmt_ts(ts: float) -> str:
+            return f"{ts:.6f}" if ts > 0 else "N/A"
+
+        def fmt_delta(start: float, end: float) -> str:
+            if start > 0 and end > 0:
+                return f"{(end - start) * 1000:.2f}ms"
+            return "N/A"
+
+        if self.disagg_mode == DisaggregationMode.DECODE:
+            logger.info(
+                f"[PD-LIFECYCLE] req={req_id} DECODE side:\n"
+                f"  send_bootstrap:    {fmt_ts(self.decode_send_bootstrap_time)}\n"
+                f"  kv_ready_recv:     {fmt_ts(self.decode_kv_ready_recv_time)}  (wait: {fmt_delta(self.decode_send_bootstrap_time, self.decode_kv_ready_recv_time)})\n"
+                f"  process_start:     {fmt_ts(self.decode_process_start_time)}  (gap: {fmt_delta(self.decode_kv_ready_recv_time, self.decode_process_start_time)})\n"
+                f"  process_end:       {fmt_ts(self.decode_process_end_time)}  (duration: {fmt_delta(self.decode_process_start_time, self.decode_process_end_time)})\n"
+                f"  === TOTAL decode latency: {fmt_delta(self.decode_send_bootstrap_time, self.decode_process_end_time)} ==="
+            )
+        elif self.disagg_mode == DisaggregationMode.PREFILL:
+            logger.info(
+                f"[PD-LIFECYCLE] req={req_id} PREFILL side:\n"
+                f"  recv_bootstrap:    {fmt_ts(self.prefill_recv_bootstrap_time)}\n"
+                f"  compute_start:     {fmt_ts(self.prefill_compute_start_time)}  (gap: {fmt_delta(self.prefill_recv_bootstrap_time, self.prefill_compute_start_time)})\n"
+                f"  compute_end:       {fmt_ts(self.prefill_compute_end_time)}  (duration: {fmt_delta(self.prefill_compute_start_time, self.prefill_compute_end_time)})\n"
+                f"  kv_send_start:     {fmt_ts(self.prefill_kv_send_start_time)}  (gap: {fmt_delta(self.prefill_compute_end_time, self.prefill_kv_send_start_time)})\n"
+                f"  kv_send_end:       {fmt_ts(self.prefill_kv_send_end_time)}  (transfer: {fmt_delta(self.prefill_kv_send_start_time, self.prefill_kv_send_end_time)})\n"
+                f"  notify_send:       {fmt_ts(self.prefill_notify_send_time)}  (gap: {fmt_delta(self.prefill_kv_send_end_time, self.prefill_notify_send_time)})\n"
+                f"  === TOTAL prefill latency: {fmt_delta(self.prefill_recv_bootstrap_time, self.prefill_notify_send_time)} ==="
+            )
 
 
 @dataclass

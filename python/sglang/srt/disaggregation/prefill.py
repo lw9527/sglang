@@ -266,6 +266,11 @@ class PrefillBootstrapQueue:
         if not self.ensure_metadata_buffer(req):
             return False
 
+        # [PD-LIFECYCLE] Track when prefill receives bootstrap from decode
+        import time
+
+        req.time_stats.prefill_recv_bootstrap_time = time.perf_counter()
+
         req.time_stats.set_bootstrap_done_time()
         num_kv_indices = len(req.origin_input_ids)
 
@@ -512,6 +517,16 @@ class SchedulerDisaggregationPrefillMixin:
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         Adapted from process_batch_result_prefill
         """
+        # [PD-LIFECYCLE] Track when prefill compute ends
+        import time
+
+        from sglang.srt.observability.req_time_stats import DisaggregationMode
+
+        ts = time.perf_counter()
+        for req in batch.reqs:
+            if req.time_stats.disagg_mode == DisaggregationMode.PREFILL:
+                req.time_stats.prefill_compute_end_time = ts
+
         (
             logits_output,
             next_token_ids,
@@ -721,6 +736,16 @@ class SchedulerDisaggregationPrefillMixin:
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                # [PD-LIFECYCLE] Track when KV send completes and notification sent
+                import time
+
+                req.time_stats.prefill_kv_send_end_time = time.perf_counter()
+                req.time_stats.prefill_notify_send_time = (
+                    req.time_stats.prefill_kv_send_end_time
+                )
+                # Log complete prefill-side lifecycle
+                req.time_stats.log_pd_disagg_lifecycle(req.rid, logger)
+
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
@@ -1008,6 +1033,13 @@ class SchedulerDisaggregationPrefillMixin:
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
+
+        # [PD-LIFECYCLE] Track when KV send starts (only for last chunk to avoid overwriting)
+        if last_chunk:
+            import time
+
+            req.time_stats.prefill_kv_send_start_time = time.perf_counter()
+
         req.disagg_kv_sender.send(page_indices, state_indices)
         req.start_send_idx = end_idx
 

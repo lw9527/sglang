@@ -1048,6 +1048,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
+
+            # [PD-LIFECYCLE] Track when decode sends bootstrap metadata to prefill
+            import time
+
+            decode_req.req.time_stats.decode_send_bootstrap_time = time.perf_counter()
+
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
@@ -1668,6 +1674,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
+                # [PD-LIFECYCLE] Track when decode receives KV-ready notification
+                import time
+
+                decode_req.req.time_stats.decode_kv_ready_recv_time = (
+                    time.perf_counter()
+                )
+
                 if (
                     self.scheduler.enable_decode_hicache
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
