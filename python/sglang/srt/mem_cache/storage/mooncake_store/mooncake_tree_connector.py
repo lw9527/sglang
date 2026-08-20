@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import threading
+import time
 from concurrent.futures import Future
 from dataclasses import replace
 from queue import Empty, Queue
@@ -129,6 +130,8 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         tp_rank = 0
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             tp_rank = torch.distributed.get_rank(group=params.tp_cache_group)
+        self.tp_rank = tp_rank
+        self.offload_seq = 0
         extra_config = _load_storage_extra_config(
             server_args.hicache_storage_backend_extra_config
         )
@@ -170,9 +173,9 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         self.load_queue: Queue[tuple[int, list[list[PoolTransfer]], object] | None] = (
             Queue()
         )
-        self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
-            Queue()
-        )
+        self.offload_queue: Queue[
+            tuple[int, list[PoolTransfer], int, object] | None
+        ] = Queue()
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
         self.load_thread = threading.Thread(
@@ -487,35 +490,147 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
                 self.layer_done_counter.complete(counter_index, self.num_layers - 1)
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
+        self.offload_seq = getattr(self, "offload_seq", 0) + 1
+        offload_seq = self.offload_seq
+        tp_rank = getattr(self, "tp_rank", -1)
+        logger.info(
+            "[MOONCAKE_OFFLOAD] action=enter pid=%d tp_rank=%d "
+            "offload_seq=%d stage=expand pools=%s",
+            os.getpid(),
+            tp_rank,
+            offload_seq,
+            ",".join(
+                f"{transfer.name}:{len(transfer.keys or ())}" for transfer in transfers
+            ),
+        )
+        start = time.perf_counter()
         expanded = self._expand(transfers, allow_partial=True)
+        logger.info(
+            "[MOONCAKE_OFFLOAD] action=exit pid=%d tp_rank=%d "
+            "offload_seq=%d stage=expand expanded_pools=%s elapsed_ms=%.3f",
+            os.getpid(),
+            tp_rank,
+            offload_seq,
+            ",".join(
+                f"{transfer.name}:{len(transfer.keys or ())}" for transfer in expanded
+            ),
+            (time.perf_counter() - start) * 1000,
+        )
         if not expanded:
+            logger.info(
+                "[MOONCAKE_OFFLOAD] action=return pid=%d tp_rank=%d "
+                "offload_seq=%d reason=no_expanded_transfers",
+                os.getpid(),
+                tp_rank,
+                offload_seq,
+            )
             return False
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
+        logger.info(
+            "[MOONCAKE_OFFLOAD] action=enter pid=%d tp_rank=%d "
+            "offload_seq=%d stage=record_ready_event tokens=%d",
+            os.getpid(),
+            tp_rank,
+            offload_seq,
+            tokens,
+        )
+        start = time.perf_counter()
         ready_event = device_module.Event()
         ready_event.record()
-        self.offload_queue.put((expanded, tokens, ready_event))
+        logger.info(
+            "[MOONCAKE_OFFLOAD] action=exit pid=%d tp_rank=%d "
+            "offload_seq=%d stage=record_ready_event tokens=%d elapsed_ms=%.3f",
+            os.getpid(),
+            tp_rank,
+            offload_seq,
+            tokens,
+            (time.perf_counter() - start) * 1000,
+        )
+        logger.info(
+            "[MOONCAKE_OFFLOAD] action=queued pid=%d tp_rank=%d "
+            "offload_seq=%d tokens=%d pools=%s",
+            os.getpid(),
+            tp_rank,
+            offload_seq,
+            tokens,
+            ",".join(
+                f"{transfer.name}:{len(transfer.keys or ())}" for transfer in expanded
+            ),
+        )
+        self.offload_queue.put((offload_seq, expanded, tokens, ready_event))
         return True
 
     def offload_thread_func(self) -> None:
         while True:
             task = self.offload_queue.get()
+            offload_seq = -1
+            tokens = 0
             try:
                 if task is None:
                     return
-                expanded, tokens, ready_event = task
+                offload_seq, expanded, tokens, ready_event = task
+                tp_rank = getattr(self, "tp_rank", -1)
+                logger.info(
+                    "[MOONCAKE_OFFLOAD] action=enter pid=%d tp_rank=%d "
+                    "offload_seq=%d stage=ready_event tokens=%d",
+                    os.getpid(),
+                    tp_rank,
+                    offload_seq,
+                    tokens,
+                )
+                start = time.perf_counter()
                 ready_event.synchronize()
+                logger.info(
+                    "[MOONCAKE_OFFLOAD] action=exit pid=%d tp_rank=%d "
+                    "offload_seq=%d stage=ready_event tokens=%d elapsed_ms=%.3f",
+                    os.getpid(),
+                    tp_rank,
+                    offload_seq,
+                    tokens,
+                    (time.perf_counter() - start) * 1000,
+                )
+                logger.info(
+                    "[MOONCAKE_OFFLOAD] action=enter pid=%d tp_rank=%d "
+                    "offload_seq=%d stage=batch_set_v2 tokens=%d",
+                    os.getpid(),
+                    tp_rank,
+                    offload_seq,
+                    tokens,
+                )
+                self.storage._connector_offload_seq = offload_seq
+                start = time.perf_counter()
                 results = self.storage.batch_set_v2(expanded)
                 success = self._all_succeeded(results, expanded)
+                logger.info(
+                    "[MOONCAKE_OFFLOAD] action=exit pid=%d tp_rank=%d "
+                    "offload_seq=%d stage=batch_set_v2 tokens=%d "
+                    "elapsed_ms=%.3f success=%s",
+                    os.getpid(),
+                    tp_rank,
+                    offload_seq,
+                    tokens,
+                    (time.perf_counter() - start) * 1000,
+                    success,
+                )
                 if success:
                     self.stats["offload"] += 1
                     if self.stats["offload"] == 1:
                         logger.info("Unified tree Mooncake offload: tokens=%d", tokens)
                 self.offload_results.put(success)
             except BaseException:
-                logger.exception("Mooncake offload failed")
+                logger.exception(
+                    "Mooncake offload failed: pid=%d tp_rank=%d "
+                    "offload_seq=%d tokens=%d",
+                    os.getpid(),
+                    getattr(self, "tp_rank", -1),
+                    offload_seq,
+                    tokens,
+                )
                 self.offload_results.put(False)
             finally:
+                if hasattr(self.storage, "_connector_offload_seq"):
+                    self.storage._connector_offload_seq = None
                 self.offload_queue.task_done()
 
     def num_completed_offloads(self) -> int:
@@ -534,6 +649,7 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             except Empty:
                 break
         self.layer_done_counter.reset()
+        self.offload_seq = 0
 
     def close(self) -> None:
         self.reset()
