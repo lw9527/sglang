@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import InsertResult
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -14,6 +15,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.mooncake_store import mooncake_tree_connector
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_tree_connector import (
     LayerWiseLoadCounter,
     MooncakeTreeConnector,
@@ -109,11 +111,10 @@ def test_unified_tree_node_exposes_hash_chain():
     assert child.get_prefix_hash_values(parent) == ["a", "b"]
 
 
-def test_connector_reduction_includes_pipeline_group(monkeypatch):
+def test_connector_reduction_uses_attention_groups(monkeypatch):
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.attn_cp_group = object()
     cache.attn_tp_group = object()
-    cache.pp_group = object()
     cache.tp_group = object()
     cache.tp_world_size = 2
     calls = []
@@ -129,17 +130,14 @@ def test_connector_reduction_includes_pipeline_group(monkeypatch):
         lambda tensor, op, group: calls.append(group),
     )
 
-    cache._all_reduce_attn_groups(
-        torch.tensor([1]), torch.distributed.ReduceOp.MIN
-    )
-    assert calls == [cache.attn_cp_group, cache.attn_tp_group, cache.pp_group]
+    cache._all_reduce_attn_groups(torch.tensor([1]), torch.distributed.ReduceOp.MIN)
+    assert calls == [cache.attn_cp_group, cache.attn_tp_group]
 
 
-def test_connector_reduction_keeps_tp_fallback_with_pipeline_group(monkeypatch):
+def test_connector_reduction_uses_tp_fallback(monkeypatch):
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.attn_cp_group = None
     cache.attn_tp_group = None
-    cache.pp_group = object()
     cache.tp_group = object()
     cache.tp_world_size = 2
     calls = []
@@ -151,10 +149,20 @@ def test_connector_reduction_keeps_tp_fallback_with_pipeline_group(monkeypatch):
         lambda tensor, op, group: calls.append(group),
     )
 
-    cache._all_reduce_attn_groups(
-        torch.tensor([1]), torch.distributed.ReduceOp.MIN
-    )
-    assert calls == [cache.tp_group, cache.pp_group]
+    cache._all_reduce_attn_groups(torch.tensor([1]), torch.distributed.ReduceOp.MIN)
+    assert calls == [cache.tp_group]
+
+
+def test_connector_rejects_pipeline_parallelism():
+    mixin = UnifiedCacheConnectorMixin()
+    mixin.tree_components = (ComponentType.FULL,)
+
+    try:
+        mixin.init_connector(SimpleNamespace(), SimpleNamespace(pp_size=2))
+    except ValueError as error:
+        assert "pipeline parallelism" in str(error)
+    else:
+        raise AssertionError("Expected pipeline parallel connector rejection.")
 
 
 def test_sparse_multi_component_layer_ranges():
@@ -219,6 +227,31 @@ def test_lookup_returns_sparse_mamba_boundaries():
     assert valid == [2, 4]
 
 
+def test_partial_load_can_expand_a_side_pool_without_kv():
+    connector = MooncakeTreeConnector.__new__(MooncakeTreeConnector)
+    connector.sources = {
+        PoolName.KV: PoolName.KV,
+        PoolName.SWA: PoolName.SWA,
+    }
+    identity_pool = SimpleNamespace(translate_indices=lambda indices: indices)
+    connector.pools = {
+        PoolName.KV: identity_pool,
+        PoolName.SWA: identity_pool,
+    }
+    swa = PoolTransfer(
+        name=PoolName.SWA,
+        keys=["page"],
+        device_indices=torch.tensor([20, 21]),
+    )
+
+    expanded = connector._expand([swa], allow_partial=True, allow_missing_kv=True)
+
+    assert len(expanded) == 1
+    assert expanded[0].name == PoolName.SWA
+    assert expanded[0].keys == ["page"]
+    assert expanded[0].host_indices.tolist() == [20, 21]
+
+
 def test_layerwise_load_reports_session_end_failure():
     class _Store:
         def batch_get_session_start(self, keys):
@@ -267,11 +300,57 @@ def test_layerwise_load_reports_session_end_failure():
     assert isinstance(future.exception(), RuntimeError)
 
 
-def test_offload_runs_on_background_thread():
+def test_load_waits_for_scheduler_stream(monkeypatch):
+    event_calls = []
+    loaded = threading.Event()
+
+    class _Event:
+        def record(self):
+            event_calls.append("record")
+
+        def synchronize(self):
+            event_calls.append("synchronize")
+
+    monkeypatch.setattr(mooncake_tree_connector.device_module, "Event", _Event)
+
+    connector = MooncakeTreeConnector.__new__(MooncakeTreeConnector)
+    connector.pending_loads = {"rid": [object()]}
+    connector.layer_done_counter = SimpleNamespace(update_producer=lambda: 7)
+    connector.load_queue = Queue()
+    connector.stats = {"load": 0}
+
+    def run_layer_wise(counter_index, transfers):
+        assert event_calls == ["record", "synchronize"]
+        assert counter_index == 7
+        assert len(transfers) == 1
+        loaded.set()
+
+    connector._run_layer_wise_batch = run_layer_wise
+    thread = threading.Thread(target=connector.load_thread_func, daemon=True)
+    thread.start()
+
+    assert connector.start_layer_wise_loading() == 7
+    assert loaded.wait(timeout=5)
+    connector.load_queue.join()
+    connector.load_queue.put(None)
+    thread.join(timeout=5)
+
+
+def test_offload_runs_on_background_thread(monkeypatch):
     started = threading.Event()
     release = threading.Event()
     caller_thread = threading.get_ident()
     worker_threads = []
+    event_calls = []
+
+    class _Event:
+        def record(self):
+            event_calls.append("record")
+
+        def synchronize(self):
+            event_calls.append("synchronize")
+
+    monkeypatch.setattr(mooncake_tree_connector.device_module, "Event", _Event)
 
     class _Storage:
         def batch_set_v2(self, transfers):
@@ -312,6 +391,7 @@ def test_offload_runs_on_background_thread():
     assert connector.num_completed_offloads() == 0
     assert worker_threads == [connector.offload_thread.ident]
     assert worker_threads[0] != caller_thread
+    assert event_calls == ["record", "synchronize"]
 
     release.set()
     connector.offload_queue.join()
@@ -387,7 +467,6 @@ def test_deepseek_v4_device_pool_group_maps_sparse_sidecars():
         )
 
     kvcache = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
-    kvcache._unified_kv = False
     kvcache.start_layer = 0
     kvcache.end_layer = 3
     kvcache.swa_page_size = 2
@@ -527,8 +606,9 @@ def test_mamba_connector_load_allocates_cache_and_request_slots():
     assert allocator.freed[-1].tolist() == [9, 10]
 
 
-def test_overlapping_load_retargets_freed_slots_to_tree_values():
+def test_overlapping_load_only_requeues_adopted_pages():
     mixin = UnifiedCacheConnectorMixin()
+    mixin.page_size = 2
     mixin.token_to_kv_pool_allocator = SimpleNamespace(
         translate_loc_from_full_to_swa=lambda indices: indices + 1000
     )
@@ -544,10 +624,20 @@ def test_overlapping_load_retargets_freed_slots_to_tree_values():
     )
 
     full = PoolTransfer(
-        name=PoolName.KV, device_indices=torch.tensor([100, 101, 102, 103])
+        name=PoolName.KV,
+        keys=["a", "b"],
+        device_indices=torch.tensor([100, 101, 102, 103]),
     )
-    swa = PoolTransfer(name=PoolName.SWA, device_indices=torch.tensor([200, 201]))
-    mamba = PoolTransfer(name=PoolName.MAMBA, device_indices=torch.tensor([300, 301]))
+    swa = PoolTransfer(
+        name=PoolName.SWA,
+        keys=["b"],
+        device_indices=torch.tensor([200, 201]),
+    )
+    mamba = PoolTransfer(
+        name=PoolName.MAMBA,
+        keys=["b", "b"],
+        device_indices=torch.tensor([300, 301]),
+    )
     canonical_full = torch.tensor([10, 11, 12, 13])
     loaded = SimpleNamespace(
         device_indices=torch.cat([torch.tensor([1, 2]), canonical_full]),
@@ -560,13 +650,74 @@ def test_overlapping_load_retargets_freed_slots_to_tree_values():
 
     returned = mixin._retarget_connector_load(
         "second",
-        [full, swa, mamba],
+        [
+            (SimpleNamespace(component_type=ComponentType.FULL), full),
+            (SimpleNamespace(component_type=ComponentType.SWA), swa),
+            (SimpleNamespace(component_type=ComponentType.MAMBA), mamba),
+        ],
         loaded,
         device_hit_len=2,
+        prefix_len=6,
+        insert_result=InsertResult(
+            prefix_len=4,
+            mamba_exist=True,
+            adopted_ranges={
+                ComponentType.FULL: [(4, 6)],
+                ComponentType.SWA: [(4, 6)],
+            },
+        ),
     )
 
     assert returned.tolist() == canonical_full.tolist()
-    assert full.device_indices.tolist() == canonical_full.tolist()
+    assert full.keys == ["b"]
+    assert full.device_indices.tolist() == [12, 13]
     assert swa.device_indices.tolist() == [1012, 1013]
-    assert mamba.device_indices.tolist() == [30, 301]
+    assert mamba.device_indices.tolist() == [301]
     assert queued["second"] == [full, swa, mamba]
+
+
+def test_select_adopted_pages_preserves_disjoint_page_ranges():
+    mixin = UnifiedCacheConnectorMixin()
+    mixin.page_size = 2
+    indices = torch.arange(8)
+
+    selected, keys = mixin._select_adopted_pages(
+        indices,
+        [(2, 4), (6, 8)],
+        prefix_len=8,
+        keys=["a", "b", "c", "d"],
+    )
+
+    assert selected.tolist() == [2, 3, 6, 7]
+    assert keys == ["b", "d"]
+
+
+def test_fully_overlapping_load_is_cancelled_without_requeue():
+    mixin = UnifiedCacheConnectorMixin()
+    mixin.page_size = 2
+    calls = []
+    mixin.connector = SimpleNamespace(
+        cancel_queued_load=lambda rid: calls.append(("cancel", rid)),
+        load=lambda rid, transfers: calls.append(("load", rid)) or True,
+    )
+    full = PoolTransfer(
+        name=PoolName.KV,
+        keys=["a", "b"],
+        device_indices=torch.tensor([100, 101, 102, 103]),
+    )
+    loaded = SimpleNamespace(
+        device_indices=torch.tensor([10, 11, 12, 13]),
+        last_device_node=object(),
+    )
+
+    returned = mixin._retarget_connector_load(
+        "overlap",
+        [(SimpleNamespace(component_type=ComponentType.FULL), full)],
+        loaded,
+        device_hit_len=0,
+        prefix_len=4,
+        insert_result=InsertResult(prefix_len=4, adopted_ranges={}),
+    )
+
+    assert returned.tolist() == [10, 11, 12, 13]
+    assert calls == [("cancel", "overlap")]

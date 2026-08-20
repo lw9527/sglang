@@ -21,12 +21,13 @@ from __future__ import annotations
 
 import hashlib
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional, Sequence
 
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
+    InsertResult,
     MatchPrefixParams,
     MatchResult,
 )
@@ -115,6 +116,11 @@ class UnifiedCacheConnectorMixin:
     """Connector-driven match / load / offload for the unified radix tree."""
 
     def init_connector(self, server_args: ServerArgs, params: CacheInitParams) -> None:
+        if params.pp_size > 1:
+            raise ValueError(
+                "Unified tree connector does not currently support pipeline "
+                "parallelism because per-stage cache state can diverge."
+            )
         supported = {
             (ComponentType.FULL,),
             (ComponentType.FULL, ComponentType.SWA),
@@ -247,7 +253,9 @@ class UnifiedCacheConnectorMixin:
             component_transfers.append((component, transfer))
 
         prefix_len = device_hit_len + num_tokens
-        if len(component_transfers) != len(self._components_tuple):
+        local_prepared = len(component_transfers) == len(self._components_tuple)
+        prepared = self._connector_sync_success(local_prepared)
+        if not prepared:
             if component_transfers:
                 full = component_transfers[0][1]
                 for component, transfer in component_transfers:
@@ -296,6 +304,7 @@ class UnifiedCacheConnectorMixin:
                 swa_evicted_seqlen=req.swa_evicted_seqlen,
                 chunked=True,
                 priority=getattr(req, "priority", 0) or 0,
+                track_adopted_ranges=True,
             )
         )
         if mamba_transfer is not None and insert_result.mamba_exist:
@@ -305,57 +314,118 @@ class UnifiedCacheConnectorMixin:
         loaded = self.match_prefix(MatchPrefixParams(key=marker.key))
         canonical_full_indices = self._retarget_connector_load(
             req.rid,
-            transfers,
+            component_transfers,
             loaded,
             device_hit_len,
+            prefix_len,
+            insert_result,
         )
         node = loaded.last_device_node
         while node is not req.last_node:
             node.connector_offloaded = True
             node = node.parent
-        req.storage_hit_length = max(
-            getattr(req, "storage_hit_length", 0), num_tokens
-        )
+        req.storage_hit_length = max(getattr(req, "storage_hit_length", 0), num_tokens)
         return canonical_full_indices, loaded.last_device_node
 
     def _retarget_connector_load(
         self,
         rid: str,
-        transfers: list[PoolTransfer],
+        component_transfers: list[tuple[TreeComponent, PoolTransfer]],
         loaded: MatchResult,
         device_hit_len: int,
+        prefix_len: int,
+        insert_result: InsertResult,
     ) -> torch.Tensor:
-        """Retarget a queued load to the slots retained by ``insert``."""
+        """Retarget only the freshly allocated pages retained by ``insert``."""
         canonical_full = loaded.device_indices[device_hit_len:]
-        for transfer in transfers:
+        assert canonical_full.numel() == prefix_len - device_hit_len
+        assert insert_result.adopted_ranges is not None
+        transfers_to_load = []
+        for component, transfer in component_transfers:
             if transfer.name == PoolName.KV:
-                transfer.device_indices = canonical_full
+                canonical = canonical_full
             elif transfer.name == PoolName.SWA:
                 swa_len = transfer.device_indices.numel()
-                transfer.device_indices = (
+                canonical = (
                     self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                         canonical_full[-swa_len:]
-                    ).to(torch.int64)
+                    ).to(transfer.device_indices)
                 )
             else:
                 assert transfer.name == PoolName.MAMBA
+                # Mamba has one radix slot and one mutable request slot rather
+                # than page-sized token ranges. The request slot must always be
+                # populated; only suppress the radix write when insert kept an
+                # already-resident state.
                 canonical_mamba = loaded.last_device_node.component_data[
                     ComponentType.MAMBA
                 ].value
                 assert canonical_mamba is not None
-                transfer.device_indices = torch.cat(
-                    [
-                        canonical_mamba.to(transfer.device_indices),
-                        transfer.device_indices[1:],
-                    ]
-                )
+                if insert_result.mamba_exist:
+                    transfer.device_indices = transfer.device_indices[1:]
+                    transfer.keys = transfer.keys[1:]
+                else:
+                    transfer.device_indices = torch.cat(
+                        [
+                            canonical_mamba.to(transfer.device_indices),
+                            transfer.device_indices[1:],
+                        ]
+                    )
+                transfers_to_load.append(transfer)
+                continue
+
+            ranges = insert_result.adopted_ranges.get(component.component_type, ())
+            selected_indices, selected_keys = self._select_adopted_pages(
+                canonical,
+                ranges,
+                prefix_len,
+                transfer.keys,
+            )
+            if selected_keys:
+                transfer.device_indices = selected_indices
+                transfer.keys = selected_keys
+                transfers_to_load.append(transfer)
 
         self.connector.cancel_queued_load(rid)
-        if not self.connector.load(rid, transfers):
+        if transfers_to_load and not self.connector.load(rid, transfers_to_load):
             raise RuntimeError(
                 f"Failed to requeue canonical connector load for {rid=}."
             )
         return canonical_full
+
+    def _select_adopted_pages(
+        self,
+        indices: torch.Tensor,
+        ranges: Sequence[tuple[int, int]],
+        prefix_len: int,
+        keys: Optional[Sequence[str]] = None,
+    ) -> tuple[torch.Tensor, list[str]]:
+        """Select page-aligned chunks covered by absolute adopted ranges."""
+        page = self.page_size
+        coverage_start = prefix_len - len(indices)
+        pages = indices.reshape(-1, page)
+        if keys is not None:
+            assert len(keys) == len(pages)
+
+        chunks = []
+        selected_keys = []
+        for start, end in ranges:
+            start = max(start, coverage_start)
+            end = min(end, prefix_len)
+            if start >= end:
+                continue
+            assert (start - coverage_start) % page == 0
+            assert (end - coverage_start) % page == 0
+            first = (start - coverage_start) // page
+            last = (end - coverage_start) // page
+            chunks.append(pages[first:last].reshape(-1))
+            if keys is not None:
+                selected_keys.extend(keys[first:last])
+
+        if not chunks:
+            return indices[:0], selected_keys
+        selected = chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+        return selected, selected_keys
 
     # ---- offload: device -> remote, driven by the write-through chain ----
 

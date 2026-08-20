@@ -63,6 +63,7 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    track_adopted_ranges: bool = False
 
 
 @dataclasses.dataclass
@@ -71,6 +72,20 @@ class InsertResult:
 
     prefix_len: int
     mamba_exist: bool = False
+    adopted_ranges: Optional[dict[ComponentType, list[tuple[int, int]]]] = None
+
+    def record_adopted_range(
+        self, component_type: ComponentType, start: int, end: int
+    ) -> None:
+        """Record a page range whose freshly allocated slots survived insert."""
+        if self.adopted_ranges is None or start >= end:
+            return
+        ranges = self.adopted_ranges.setdefault(component_type, [])
+        if ranges and start <= ranges[-1][1]:
+            previous_start, previous_end = ranges[-1]
+            ranges[-1] = (min(previous_start, start), max(previous_end, end))
+        else:
+            ranges.append((start, end))
 
 
 @dataclasses.dataclass

@@ -228,7 +228,9 @@ def resolve_hybrid_device_pool_group(
     )
 
     if isinstance(kvcache, DeepSeekV4TokenToKVPool):
-        if kvcache._unified_kv or isinstance(kvcache.c4_kv_pool, HiSparseC4DevicePool):
+        if getattr(kvcache, "_unified_kv", False) or isinstance(
+            kvcache.c4_kv_pool, HiSparseC4DevicePool
+        ):
             raise ValueError("Direct Mooncake does not support unified-KV or HiSparse.")
         if kvcache.swa_page_size != page_size:
             raise ValueError(

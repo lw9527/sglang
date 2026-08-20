@@ -255,7 +255,6 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
         self.attn_tp_group = params.attn_tp_cache_group
-        self.pp_group = params.pp_cache_group
         self.tp_world_size = (
             1
             if self.tp_group is None
@@ -278,11 +277,6 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
                 reduced = True
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
-        if (
-            self.pp_group is not None
-            and torch.distributed.get_world_size(group=self.pp_group) > 1
-        ):
-            torch.distributed.all_reduce(tensor, op=op, group=self.pp_group)
 
     def reset(self) -> None:
         self._reset_full()
@@ -855,9 +849,14 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         value: torch.Tensor,
         params: InsertParams,
     ) -> InsertResult:
+        result = InsertResult(
+            prefix_len=0,
+            adopted_ranges={} if params.track_adopted_ranges else None,
+        )
         self._touch_node(node)
         if len(key) == 0:
-            return InsertResult(prefix_len=0, mamba_exist=True)
+            result.mamba_exist = True
+            return result
 
         child_key = key.child_key(self.page_size)
         total_prefix_length = 0
@@ -870,6 +869,11 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
 
             if node.evicted:
                 self._unevict_node_on_insert(node, value[:prefix_len])
+                result.record_adopted_range(
+                    BASE_COMPONENT_TYPE,
+                    total_prefix_length,
+                    total_prefix_length + prefix_len,
+                )
                 # FULL was restored from the request's fresh KV. Aux
                 # components (e.g. SWA) may still hold tombstones and need
                 # to rebuild their value from the same slice.
@@ -881,6 +885,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
                         prefix_len=prefix_len,
                         total_prefix_len=total_prefix_length,
                         params=params,
+                        result=result,
                     )
             else:
                 value_slice = value[:prefix_len]
@@ -893,6 +898,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
                         total_prefix_len=total_prefix_length,
                         value_slice=value_slice,
                         params=params,
+                        result=result,
                     )
                     consumed_from = min(consumed_from, comp_consumed_from)
 
@@ -924,7 +930,13 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
                 # resources here or propagate a flag so that
                 # cleanup_after_caching_req can free them properly.
                 self.token_to_kv_pool_allocator.free(value)
-                return InsertResult(prefix_len=total_prefix_length)
+                result.prefix_len = total_prefix_length
+                return result
+            result.record_adopted_range(
+                BASE_COMPONENT_TYPE,
+                total_prefix_length,
+                total_prefix_length + len(key),
+            )
             target_node = self._add_new_node(node, key, value)
             is_new_leaf = True
         else:
@@ -932,7 +944,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
 
         # Finalize: let each component attach its data to the target node.
         # e.g. Mamba attaches mamba_value to the leaf node
-        result = InsertResult(prefix_len=total_prefix_length)
+        result.prefix_len = total_prefix_length
         for component in self._components_tuple:
             component.commit_insert_component_data(
                 node=target_node,

@@ -157,6 +157,7 @@ class TreeComponent(ABC):
         total_prefix_len: int,
         value_slice: torch.Tensor,
         params: InsertParams,
+        result: InsertResult,
     ) -> int:
         """Called per-node when an insert's key overlaps an existing node.
         Returns the index within value_slice from which this component
@@ -179,6 +180,7 @@ class TreeComponent(ABC):
         prefix_len: int,
         total_prefix_len: int,
         params: InsertParams,
+        result: InsertResult,
     ) -> None:
         """Called after _unevict_node_on_insert restores the base (Full) value
         on an evicted node. Aux components (e.g. SWA) override this to rebuild

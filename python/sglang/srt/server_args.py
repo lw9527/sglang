@@ -4603,6 +4603,12 @@ class ServerArgs:
                 "it cannot be combined with --disable-radix-cache."
             )
 
+        if self.enable_unified_tree_connector and self.pp_size > 1:
+            raise ValueError(
+                "--enable-unified-tree-connector does not currently support "
+                "pipeline parallelism."
+            )
+
         if self.enable_unified_tree_connector and self.enable_lmcache:
             raise ValueError(
                 "--enable-unified-tree-connector and --enable-lmcache are "

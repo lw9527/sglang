@@ -22,8 +22,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache_connector_mixin import UnifiedTreeConnector
+from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
+device_module = get_device_module()
 
 
 def _load_storage_extra_config(value: str | None) -> dict:
@@ -165,8 +167,12 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
                 self.layer_done_counter
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
-        self.load_queue: Queue[tuple[int, list[list[PoolTransfer]]] | None] = Queue()
-        self.offload_queue: Queue[tuple[list[PoolTransfer], int] | None] = Queue()
+        self.load_queue: Queue[tuple[int, list[list[PoolTransfer]], object] | None] = (
+            Queue()
+        )
+        self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
+            Queue()
+        )
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
         self.load_thread = threading.Thread(
@@ -214,11 +220,17 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
                     )
 
     def _expand(
-        self, transfers: list[PoolTransfer], *, allow_partial: bool = False
+        self,
+        transfers: list[PoolTransfer],
+        *,
+        allow_partial: bool = False,
+        allow_missing_kv: bool = False,
     ) -> list[PoolTransfer]:
         by_name = {transfer.name: transfer for transfer in transfers}
         kv = by_name.get(PoolName.KV)
-        if kv is None or not kv.keys:
+        if kv is None and not allow_missing_kv:
+            return []
+        if kv is not None and not kv.keys:
             return []
         if not allow_partial and not set(self.sources.values()) <= set(by_name):
             return []
@@ -228,7 +240,12 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             source = by_name.get(source_name)
             if source is None:
                 continue
-            keys = kv.keys if source_name == PoolName.KV else source.keys
+            if source_name == PoolName.KV:
+                if kv is None:
+                    continue
+                keys = kv.keys
+            else:
+                keys = source.keys
             indices = source.device_indices
             expanded.append(
                 replace(
@@ -309,7 +326,10 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         return valid
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
-        expanded = self._expand(transfers)
+        # Insert can deduplicate some component pages against resident L1 data,
+        # so the committed load may intentionally contain only a subset of the
+        # logical pools (or only a side pool such as SWA).
+        expanded = self._expand(transfers, allow_partial=True, allow_missing_kv=True)
         if not expanded:
             return False
         if rid in self.pending_loads:
@@ -327,7 +347,9 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         self.pending_loads = {}
 
         counter_index = self.layer_done_counter.update_producer()
-        self.load_queue.put((counter_index, list(pending.values())))
+        ready_event = device_module.Event()
+        ready_event.record()
+        self.load_queue.put((counter_index, list(pending.values()), ready_event))
         self.stats["load"] += len(pending)
         return counter_index
 
@@ -337,7 +359,13 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             try:
                 if task is None:
                     return
-                counter_index, transfers = task
+                counter_index, transfers, ready_event = task
+                try:
+                    ready_event.synchronize()
+                except BaseException as error:
+                    self.layer_done_counter.fail(counter_index, error)
+                    logger.exception("Mooncake load readiness event failed")
+                    continue
                 self._run_layer_wise_batch(counter_index, transfers)
             finally:
                 self.load_queue.task_done()
@@ -464,7 +492,9 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             return False
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
-        self.offload_queue.put((expanded, tokens))
+        ready_event = device_module.Event()
+        ready_event.record()
+        self.offload_queue.put((expanded, tokens, ready_event))
         return True
 
     def offload_thread_func(self) -> None:
@@ -473,8 +503,8 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             try:
                 if task is None:
                     return
-                expanded, tokens = task
-                self._wait_for_device()
+                expanded, tokens, ready_event = task
+                ready_event.synchronize()
                 results = self.storage.batch_set_v2(expanded)
                 success = self._all_succeeded(results, expanded)
                 if success:
@@ -493,19 +523,6 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
 
     def pop_completed_offload(self) -> bool:
         return self.offload_results.get_nowait()
-
-    def _wait_for_device(self) -> None:
-        device = next(
-            (
-                buffer.device
-                for pool in self.pools.values()
-                for buffer in pool.get_hybrid_pool_buffer()
-                if buffer.device.type == "cuda"
-            ),
-            None,
-        )
-        if device is not None:
-            torch.cuda.synchronize(device)
 
     def reset(self) -> None:
         self.pending_loads.clear()
