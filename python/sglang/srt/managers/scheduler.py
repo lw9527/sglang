@@ -2739,6 +2739,82 @@ class Scheduler(
 
         return ret
 
+    def _log_connector_admission(
+        self,
+        *,
+        action: str,
+        req: Req,
+        adder: PrefillAdder,
+        result: Optional[AddReqResult] = None,
+        decision: Optional[str] = None,
+    ) -> None:
+        """Trace rank-local state that can make TP schedulers scan differently."""
+        if not self.server_args.enable_unified_tree_connector:
+            return
+
+        allocator = self.token_to_kv_pool_allocator
+        if adder.is_hybrid_swa:
+            allocator_available = allocator.full_available_size()
+            tree_evictable = self.tree_cache.full_evictable_size()
+            tree_protected = self.tree_cache.full_protected_size()
+            capacity_scope = "full_swa"
+        elif adder.is_hybrid_ssm_cache:
+            allocator_available = allocator.available_size()
+            tree_evictable = self.tree_cache.full_evictable_size()
+            tree_protected = self.tree_cache.full_protected_size()
+            capacity_scope = "full_ssm"
+        else:
+            allocator_available = allocator.available_size()
+            tree_evictable = self.tree_cache.evictable_size()
+            tree_protected = self.tree_cache.protected_size()
+            capacity_scope = "base"
+
+        connector = getattr(self.tree_cache, "connector", None)
+        connector_offloads = getattr(self.tree_cache, "connector_offloads", ())
+        completed_offloads = (
+            connector.num_completed_offloads() if connector is not None else -1
+        )
+        prefix_indices = getattr(req, "prefix_indices", None)
+        prefix_len = len(prefix_indices) if prefix_indices is not None else -1
+
+        logger.info(
+            "[CONNECTOR_SCHED] action=%s tp_rank=%d rid=%s result=%s "
+            "decision=%s capacity_scope=%s allocator_available=%d "
+            "tree_evictable=%d tree_protected=%d base_evictable=%d "
+            "base_protected=%d full_evictable=%d full_protected=%d "
+            "rem_total_tokens=%d rem_total_token_offset=%d "
+            "rem_input_tokens=%d rem_chunk_tokens=%s pending_offloads=%d "
+            "completed_offloads=%d can_run=%d running=%d waiting=%d "
+            "batch_is_full=%s extend_input_len=%s host_hit_length=%s "
+            "prefix_len=%d",
+            action,
+            self.tp_rank,
+            req.rid,
+            result,
+            decision,
+            capacity_scope,
+            allocator_available,
+            tree_evictable,
+            tree_protected,
+            self.tree_cache.evictable_size(),
+            self.tree_cache.protected_size(),
+            self.tree_cache.full_evictable_size(),
+            self.tree_cache.full_protected_size(),
+            adder.rem_total_tokens,
+            adder.rem_total_token_offset,
+            adder.rem_input_tokens,
+            adder.rem_chunk_tokens,
+            len(connector_offloads),
+            completed_offloads,
+            len(adder.can_run_list),
+            len(self.running_batch.reqs),
+            len(self.waiting_queue),
+            self.running_batch.batch_is_full,
+            getattr(req, "extend_input_len", None),
+            getattr(req, "host_hit_length", None),
+            prefix_len,
+        )
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2865,11 +2941,16 @@ class Scheduler(
                     req.rid
                 )
 
+            self._log_connector_admission(action="before_init", req=req, adder=adder)
             req.init_next_round_input(self.tree_cache)
+            self._log_connector_admission(action="before_add", req=req, adder=adder)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
+            )
+            self._log_connector_admission(
+                action="after_add", req=req, adder=adder, result=res
             )
 
             if self.enable_lora:
@@ -2923,6 +3004,13 @@ class Scheduler(
                         req,
                     )
                     self.waiting_queue.remove(req)
+                    self._log_connector_admission(
+                        action="decision",
+                        req=req,
+                        adder=adder,
+                        result=res,
+                        decision="abort_continue",
+                    )
                     continue
 
                 # revert matched mamba idx to avoid memory leak, if req is not added.
@@ -2939,6 +3027,13 @@ class Scheduler(
                         req.mamba_pool_idx.unsqueeze(-1)
                     )
                     req.mamba_pool_idx = None
+                self._log_connector_admission(
+                    action="decision",
+                    req=req,
+                    adder=adder,
+                    result=res,
+                    decision="break",
+                )
                 break
 
         # Update waiting queue
