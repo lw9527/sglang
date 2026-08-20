@@ -20,6 +20,7 @@ intersection, IO outcome agreement) is decided on the tree side, here.
 from __future__ import annotations
 
 import hashlib
+import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, NamedTuple, Optional, Sequence
 
@@ -38,6 +39,8 @@ from sglang.srt.mem_cache.unified_cache_components import (
     ConnectorTransferPhase,
     TreeComponent,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -144,11 +147,35 @@ class UnifiedCacheConnectorMixin:
     ) -> MatchResult:
         page = self.page_size
         device_hit_len = int(result.device_indices.numel())
+        logger.info(
+            "[CONNECTOR_BRANCH] rank=%d rid=%s phase=match action=enter "
+            "device_hit_len=%d key_len=%d",
+            self._connector_tp_rank(),
+            req.rid,
+            device_hit_len,
+            len(key),
+        )
         if device_hit_len >= len(key):
+            logger.info(
+                "[CONNECTOR_BRANCH] rank=%d rid=%s phase=match action=return "
+                "reason=device_full_hit device_hit_len=%d key_len=%d",
+                self._connector_tp_rank(),
+                req.rid,
+                device_hit_len,
+                len(key),
+            )
             return result
 
         keys = self._connector_tail_keys(key, result, device_hit_len)
         if not keys:
+            logger.info(
+                "[CONNECTOR_BRANCH] rank=%d rid=%s phase=match action=return "
+                "reason=no_tail_keys device_hit_len=%d key_len=%d",
+                self._connector_tp_rank(),
+                req.rid,
+                device_hit_len,
+                len(key),
+            )
             return result
 
         transfers = []
@@ -158,16 +185,37 @@ class UnifiedCacheConnectorMixin:
                 keys=keys,
             )
             if transfer is None:
+                logger.info(
+                    "[CONNECTOR_BRANCH] rank=%d rid=%s phase=match "
+                    "action=return reason=missing_lookup_transfer component=%s "
+                    "tail_pages=%d",
+                    self._connector_tp_rank(),
+                    req.rid,
+                    component.component_type,
+                    len(keys),
+                )
                 return result
             transfers.append(transfer)
 
         # Tail-relative: page 0 of `keys` is the first uncached page.
+        local_valid_pages = self.connector.lookup(req.rid, transfers)
         hit_pages = self._sync_connector_hit_pages(
-            self.connector.lookup(req.rid, transfers),
+            local_valid_pages,
+            rid=req.rid,
             num_pages=len(keys),
             device_hit_pages=0,
         )
         if hit_pages == 0:
+            logger.info(
+                "[CONNECTOR_BRANCH] rank=%d rid=%s phase=match action=return "
+                "reason=no_common_remote_hit local_valid_count=%d "
+                "local_valid_max=%d tail_pages=%d",
+                self._connector_tp_rank(),
+                req.rid,
+                len(local_valid_pages),
+                max(local_valid_pages, default=0),
+                len(keys),
+            )
             return result
         hit_tokens = hit_pages * page
 
@@ -182,7 +230,12 @@ class UnifiedCacheConnectorMixin:
         )
 
     def _sync_connector_hit_pages(
-        self, valid_pages: list[int], *, num_pages: int, device_hit_pages: int
+        self,
+        valid_pages: list[int],
+        *,
+        rid: str,
+        num_pages: int,
+        device_hit_pages: int,
     ) -> int:
         """Intersect the per-rank sets of restorable prefix lengths and return the
         longest one, or 0 when the ranks share none beyond the device prefix."""
@@ -190,7 +243,17 @@ class UnifiedCacheConnectorMixin:
         for pages in valid_pages:
             if device_hit_pages < pages <= num_pages:
                 mask[pages] = 1
-        self._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
+        self._all_reduce_attn_groups(
+            mask,
+            torch.distributed.ReduceOp.MIN,
+            connector_trace=(
+                rid,
+                "lookup_hit_pages",
+                f"local_valid_count={len(valid_pages)} "
+                f"local_valid_max={max(valid_pages, default=0)} "
+                f"num_pages={num_pages} device_hit_pages={device_hit_pages}",
+            ),
+        )
         common = mask.nonzero()
         if common.numel() == 0:
             return 0
@@ -235,7 +298,22 @@ class UnifiedCacheConnectorMixin:
         empty = self._empty_match_result.device_indices
         marker = self._connector_markers.pop(req.rid, None)
         if marker is None:
+            logger.info(
+                "[CONNECTOR_BRANCH] rank=%d rid=%s phase=load action=return "
+                "reason=marker_missing",
+                self._connector_tp_rank(),
+                req.rid,
+            )
             return empty, req.last_node
+
+        logger.info(
+            "[CONNECTOR_BRANCH] rank=%d rid=%s phase=load action=enter "
+            "device_hit_len=%d tail_pages=%d",
+            self._connector_tp_rank(),
+            req.rid,
+            marker.device_hit_len,
+            len(marker.keys),
+        )
 
         device_hit_len = marker.device_hit_len
         tail_keys = marker.keys
@@ -254,7 +332,11 @@ class UnifiedCacheConnectorMixin:
 
         prefix_len = device_hit_len + num_tokens
         local_prepared = len(component_transfers) == len(self._components_tuple)
-        prepared = self._connector_sync_success(local_prepared)
+        prepared = self._connector_sync_success(
+            local_prepared,
+            rid=req.rid,
+            phase="load_prepared",
+        )
         if not prepared:
             if component_transfers:
                 full = component_transfers[0][1]
@@ -271,7 +353,11 @@ class UnifiedCacheConnectorMixin:
 
         transfers = [transfer for _, transfer in component_transfers]
         local_success = self.connector.load(req.rid, transfers)
-        success = self._connector_sync_success(local_success)
+        success = self._connector_sync_success(
+            local_success,
+            rid=req.rid,
+            phase="load_queued",
+        )
         if local_success and not success:
             self.connector.cancel_queued_load(req.rid)
         for component, transfer in component_transfers:
@@ -462,17 +548,32 @@ class UnifiedCacheConnectorMixin:
             node.connector_offloaded = self.connector.pop_completed_offload()
             self.dec_lock_ref(node, lock_params)
 
-    def _connector_sync_success(self, success: bool) -> bool:
+    def _connector_sync_success(self, success: bool, *, rid: str, phase: str) -> bool:
         """MIN-reduce a per-rank IO outcome so every rank takes the same branch."""
         synced = torch.tensor([int(success)], dtype=torch.int)
-        self._all_reduce_attn_groups(synced, torch.distributed.ReduceOp.MIN)
+        self._all_reduce_attn_groups(
+            synced,
+            torch.distributed.ReduceOp.MIN,
+            connector_trace=(rid, phase, f"local_success={int(success)}"),
+        )
         return bool(synced.item())
+
+    def _connector_tp_rank(self) -> int:
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
+            return 0
+        if self.tp_group is None:
+            return torch.distributed.get_rank()
+        return torch.distributed.get_rank(group=self.tp_group)
 
     # ---- lifecycle helpers used by the tree's own hooks ----
 
     def reset_connector_state(self) -> None:
         self._connector_markers: dict[str, ConnectorMarker] = {}
         self.connector_offloads = []
+        self._connector_collective_seq = 0
 
     def release_connector_request(self, rid: str) -> None:
         if self.connector is not None:

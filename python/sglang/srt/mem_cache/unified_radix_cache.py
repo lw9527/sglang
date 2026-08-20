@@ -269,14 +269,89 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
-    def _all_reduce_attn_groups(self, tensor: torch.Tensor, op) -> None:
+    def _all_reduce_attn_groups(
+        self,
+        tensor: torch.Tensor,
+        op,
+        *,
+        connector_trace: Optional[tuple[str, str, str]] = None,
+    ) -> None:
         reduced = False
-        for group in (self.attn_cp_group, self.attn_tp_group):
+        for group_name, group in (
+            ("attn_cp", self.attn_cp_group),
+            ("attn_tp", self.attn_tp_group),
+        ):
             if group is not None and torch.distributed.get_world_size(group=group) > 1:
-                torch.distributed.all_reduce(tensor, op=op, group=group)
+                self._all_reduce_cache_group(
+                    tensor,
+                    op,
+                    group,
+                    group_name,
+                    connector_trace,
+                )
                 reduced = True
         if not reduced and self.tp_world_size > 1:
-            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+            self._all_reduce_cache_group(
+                tensor,
+                op,
+                self.tp_group,
+                "tp",
+                connector_trace,
+            )
+
+    def _all_reduce_cache_group(
+        self,
+        tensor: torch.Tensor,
+        op,
+        group,
+        group_name: str,
+        connector_trace: Optional[tuple[str, str, str]],
+    ) -> None:
+        if connector_trace is None:
+            torch.distributed.all_reduce(tensor, op=op, group=group)
+            return
+
+        rid, phase, local_state = connector_trace
+        self._connector_collective_seq = (
+            getattr(self, "_connector_collective_seq", 0) + 1
+        )
+        seq = self._connector_collective_seq
+        global_rank = torch.distributed.get_rank()
+        group_rank = torch.distributed.get_rank(group=group)
+        world_size = torch.distributed.get_world_size(group=group)
+        backend = torch.distributed.get_backend(group)
+        shape = tuple(tensor.shape)
+        logger.info(
+            "[CONNECTOR_COLLECTIVE] enter global_rank=%d group_rank=%d seq=%d "
+            "rid=%s phase=%s group=%s backend=%s world_size=%d shape=%s "
+            "dtype=%s device=%s %s",
+            global_rank,
+            group_rank,
+            seq,
+            rid,
+            phase,
+            group_name,
+            backend,
+            world_size,
+            shape,
+            tensor.dtype,
+            tensor.device,
+            local_state,
+        )
+        torch.distributed.all_reduce(tensor, op=op, group=group)
+        logger.info(
+            "[CONNECTOR_COLLECTIVE] exit global_rank=%d group_rank=%d seq=%d "
+            "rid=%s phase=%s group=%s backend=%s world_size=%d shape=%s",
+            global_rank,
+            group_rank,
+            seq,
+            rid,
+            phase,
+            group_name,
+            backend,
+            world_size,
+            shape,
+        )
 
     def reset(self) -> None:
         self._reset_full()
