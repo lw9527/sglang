@@ -417,7 +417,7 @@ def test_async_offload_pins_node_until_completion():
     mixin.connector = connector
     mixin._components_tuple = (_Component(),)
     mixin.connector_offloads = []
-    mixin._all_reduce_attn_groups = lambda tensor, op, **kwargs: None
+    mixin._all_reduce_attn_groups = lambda tensor, op: None
     lock_params = object()
     locks = []
     unlocks = []
@@ -457,7 +457,7 @@ def test_async_offload_drains_only_common_tp_prefix():
 
     reduce_calls = 0
 
-    def reduce_to_common_state(value, op, **kwargs):
+    def reduce_to_common_state(value, op):
         nonlocal reduce_calls
         assert op == torch.distributed.ReduceOp.MIN
         reduce_calls += 1

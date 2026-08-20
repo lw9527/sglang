@@ -548,11 +548,6 @@ class UnifiedCacheConnectorMixin:
         self._all_reduce_attn_groups(
             finish_count,
             torch.distributed.ReduceOp.MIN,
-            connector_trace=(
-                "offload",
-                "completed_count",
-                f"local_count={local_count} pending={len(self.connector_offloads)}",
-            ),
         )
         common_count = int(finish_count.item())
 
@@ -564,12 +559,6 @@ class UnifiedCacheConnectorMixin:
             self._all_reduce_attn_groups(
                 successes,
                 torch.distributed.ReduceOp.MIN,
-                connector_trace=(
-                    "offload",
-                    "completed_success",
-                    f"common_count={common_count} "
-                    f"local_successes={list(map(int, local_successes))}",
-                ),
             )
             global_successes = [bool(success) for success in successes.tolist()]
         else:
