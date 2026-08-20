@@ -710,8 +710,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # storage objects per logical page, but API still reports page-level result.
         results: dict = {}
         for transfer in transfers:
-            offload_seq = getattr(self, "_connector_offload_seq", None)
-            trace_connector_offload = is_set and offload_seq is not None
             host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
             keys = transfer.keys
             page_size = getattr(host_pool, "page_size", 1) or 1
@@ -719,17 +717,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             assert len(keys) > 0
             assert len(keys) == len(host_indices) // page_size
 
-            if trace_connector_offload:
-                logger.info(
-                    "[MOONCAKE_OFFLOAD_IO] action=enter pid=%d tp_rank=%d "
-                    "offload_seq=%s stage=prepare pool=%s page_count=%d",
-                    os.getpid(),
-                    self.local_rank,
-                    offload_seq,
-                    transfer.name,
-                    len(keys),
-                )
-                prepare_start = time.perf_counter()
             ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
@@ -741,75 +728,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
 
             if is_set:
-                if trace_connector_offload:
-                    logger.info(
-                        "[MOONCAKE_OFFLOAD_IO] action=exit pid=%d tp_rank=%d "
-                        "offload_seq=%s stage=prepare pool=%s page_count=%d "
-                        "object_count=%d elapsed_ms=%.3f",
-                        os.getpid(),
-                        self.local_rank,
-                        offload_seq,
-                        transfer.name,
-                        len(keys),
-                        len(key_strs),
-                        (time.perf_counter() - prepare_start) * 1000,
-                    )
-                    logger.info(
-                        "[MOONCAKE_OFFLOAD_IO] action=enter pid=%d tp_rank=%d "
-                        "offload_seq=%s stage=batch_is_exist pool=%s object_count=%d",
-                        os.getpid(),
-                        self.local_rank,
-                        offload_seq,
-                        transfer.name,
-                        len(key_strs),
-                    )
-                exist_start = time.perf_counter()
                 exist_result = self._batch_exist(key_strs)
-                if trace_connector_offload:
-                    logger.info(
-                        "[MOONCAKE_OFFLOAD_IO] action=exit pid=%d tp_rank=%d "
-                        "offload_seq=%s stage=batch_is_exist pool=%s "
-                        "object_count=%d existing=%d elapsed_ms=%.3f",
-                        os.getpid(),
-                        self.local_rank,
-                        offload_seq,
-                        transfer.name,
-                        len(key_strs),
-                        sum(state == 1 for state in exist_result),
-                        (time.perf_counter() - exist_start) * 1000,
-                    )
                 io_results = [0 if state == 1 else -1 for state in exist_result]
                 missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
                 if missing_idx:
-                    if trace_connector_offload:
-                        logger.info(
-                            "[MOONCAKE_OFFLOAD_IO] action=enter pid=%d tp_rank=%d "
-                            "offload_seq=%s stage=batch_put pool=%s object_count=%d",
-                            os.getpid(),
-                            self.local_rank,
-                            offload_seq,
-                            transfer.name,
-                            len(missing_idx),
-                        )
-                    put_start = time.perf_counter()
                     put_results = self._put_batch_zero_copy_impl(
                         [key_strs[i] for i in missing_idx],
                         [ptr_list[i] for i in missing_idx],
                         [element_size_list[i] for i in missing_idx],
                     )
-                    if trace_connector_offload:
-                        logger.info(
-                            "[MOONCAKE_OFFLOAD_IO] action=exit pid=%d tp_rank=%d "
-                            "offload_seq=%s stage=batch_put pool=%s object_count=%d "
-                            "succeeded=%d elapsed_ms=%.3f",
-                            os.getpid(),
-                            self.local_rank,
-                            offload_seq,
-                            transfer.name,
-                            len(missing_idx),
-                            sum(result == 0 for result in put_results),
-                            (time.perf_counter() - put_start) * 1000,
-                        )
                     for i, res in zip(missing_idx, put_results):
                         io_results[i] = res
             else:
