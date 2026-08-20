@@ -540,12 +540,44 @@ class UnifiedCacheConnectorMixin:
     def drain_connector_offloads(self) -> None:
         if self.connector is None:
             return
-        count = min(
+
+        local_count = min(
             self.connector.num_completed_offloads(), len(self.connector_offloads)
         )
-        for _ in range(count):
+        finish_count = torch.tensor([local_count], dtype=torch.int, device="cpu")
+        self._all_reduce_attn_groups(
+            finish_count,
+            torch.distributed.ReduceOp.MIN,
+            connector_trace=(
+                "offload",
+                "completed_count",
+                f"local_count={local_count} pending={len(self.connector_offloads)}",
+            ),
+        )
+        common_count = int(finish_count.item())
+
+        local_successes = [
+            self.connector.pop_completed_offload() for _ in range(common_count)
+        ]
+        if local_successes:
+            successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
+            self._all_reduce_attn_groups(
+                successes,
+                torch.distributed.ReduceOp.MIN,
+                connector_trace=(
+                    "offload",
+                    "completed_success",
+                    f"common_count={common_count} "
+                    f"local_successes={list(map(int, local_successes))}",
+                ),
+            )
+            global_successes = [bool(success) for success in successes.tolist()]
+        else:
+            global_successes = []
+
+        for success in global_successes:
             node, lock_params = self.connector_offloads.pop(0)
-            node.connector_offloaded = self.connector.pop_completed_offload()
+            node.connector_offloaded = success
             self.dec_lock_ref(node, lock_params)
 
     def _connector_sync_success(self, success: bool, *, rid: str, phase: str) -> bool:

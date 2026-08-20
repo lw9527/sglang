@@ -417,6 +417,7 @@ def test_async_offload_pins_node_until_completion():
     mixin.connector = connector
     mixin._components_tuple = (_Component(),)
     mixin.connector_offloads = []
+    mixin._all_reduce_attn_groups = lambda tensor, op, **kwargs: None
     lock_params = object()
     locks = []
     unlocks = []
@@ -438,6 +439,45 @@ def test_async_offload_pins_node_until_completion():
     mixin.drain_connector_offloads()
     assert not node.connector_offloaded
     assert unlocks == [(node, lock_params)]
+
+
+def test_async_offload_drains_only_common_tp_prefix():
+    results = [True, True, True]
+    connector = SimpleNamespace(
+        num_completed_offloads=lambda: len(results),
+        pop_completed_offload=lambda: results.pop(0),
+    )
+    mixin = UnifiedCacheConnectorMixin()
+    mixin.connector = connector
+    nodes = [SimpleNamespace(connector_offloaded=True) for _ in range(3)]
+    lock_params = [object() for _ in range(3)]
+    mixin.connector_offloads = list(zip(nodes, lock_params))
+    unlocks = []
+    mixin.dec_lock_ref = lambda node, params: unlocks.append((node, params))
+
+    reduce_calls = 0
+
+    def reduce_to_common_state(value, op, **kwargs):
+        nonlocal reduce_calls
+        assert op == torch.distributed.ReduceOp.MIN
+        reduce_calls += 1
+        if reduce_calls == 1:
+            assert value.tolist() == [3]
+            value.fill_(1)
+        else:
+            assert value.tolist() == [1]
+            value.fill_(0)
+
+    mixin._all_reduce_attn_groups = reduce_to_common_state
+    mixin.drain_connector_offloads()
+
+    assert reduce_calls == 2
+    assert results == [True, True]
+    assert mixin.connector_offloads == list(zip(nodes[1:], lock_params[1:]))
+    assert not nodes[0].connector_offloaded
+    assert nodes[1].connector_offloaded
+    assert nodes[2].connector_offloaded
+    assert unlocks == [(nodes[0], lock_params[0])]
 
 
 def test_release_connector_request_cancels_queued_load():
