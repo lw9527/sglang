@@ -116,11 +116,6 @@ class UnifiedCacheConnectorMixin:
     """Connector-driven match / load / offload for the unified radix tree."""
 
     def init_connector(self, server_args: ServerArgs, params: CacheInitParams) -> None:
-        if params.pp_size > 1:
-            raise ValueError(
-                "Unified tree connector does not currently support pipeline "
-                "parallelism because per-stage cache state can diverge."
-            )
         supported = {
             (ComponentType.FULL,),
             (ComponentType.FULL, ComponentType.SWA),

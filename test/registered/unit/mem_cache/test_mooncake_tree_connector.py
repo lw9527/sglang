@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     UnifiedTreeNode,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -153,16 +154,35 @@ def test_connector_reduction_uses_tp_fallback(monkeypatch):
     assert calls == [cache.tp_group]
 
 
-def test_connector_rejects_pipeline_parallelism():
+def test_connector_allows_pipeline_parallelism(monkeypatch):
     mixin = UnifiedCacheConnectorMixin()
     mixin.tree_components = (ComponentType.FULL,)
+    connector = object()
+    calls = []
 
-    try:
-        mixin.init_connector(SimpleNamespace(), SimpleNamespace(pp_size=2))
-    except ValueError as error:
-        assert "pipeline parallelism" in str(error)
-    else:
-        raise AssertionError("Expected pipeline parallel connector rejection.")
+    monkeypatch.setattr(
+        mooncake_tree_connector,
+        "MooncakeTreeConnector",
+        lambda server_args, params: calls.append((server_args, params)) or connector,
+    )
+    server_args = SimpleNamespace()
+    params = SimpleNamespace(pp_size=2)
+
+    mixin.init_connector(server_args, params)
+
+    assert calls == [(server_args, params)]
+    assert mixin.connector is connector
+    assert mixin.write_through_threshold == 1
+
+
+def test_server_args_allow_connector_pipeline_parallelism():
+    server_args = ServerArgs(
+        model_path="dummy",
+        enable_unified_tree_connector=True,
+        pp_size=2,
+    )
+
+    server_args._handle_cache_compatibility()
 
 
 def test_sparse_multi_component_layer_ranges():
