@@ -1578,6 +1578,14 @@ class Indexer(MultiPlatformOp):
                         enable_dual_stream if not _is_hcu else False,
                         forward_batch=forward_batch,
                     )
+                    logger.warning(
+                        f"[NSA_STORE_DIAG] layer_id={layer_id} "
+                        f"key.shape={key.shape} "
+                        f"out_cache_loc.shape={forward_batch.out_cache_loc.shape} "
+                        f"attn_cp_metadata={'SET' if forward_batch.attn_cp_metadata is not None else 'NONE'} "
+                        f"nsa_enable_prefill_cp={self.nsa_enable_prefill_cp} "
+                        f"gather_guard={forward_batch.attn_cp_metadata is not None and self.nsa_enable_prefill_cp}"
+                    )
                     forward_batch.token_to_kv_pool.set_index_k_buffer(
                         layer_id=layer_id,
                         loc=forward_batch.out_cache_loc,

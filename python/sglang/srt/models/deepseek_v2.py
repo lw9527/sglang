@@ -3661,8 +3661,18 @@ class DeepseekV2Model(nn.Module):
         )
 
         if nsa_use_prefill_cp(forward_batch):
+            logger.warning(
+                f"[NSA_SPLIT_DIAG] pp_rank={self.pp_group.rank_in_group} "
+                f"is_first_rank={self.pp_group.is_first_rank} "
+                f"hidden_states.shape_before_split={hidden_states.shape} "
+                f"will_split_hidden_states={self.pp_group.is_first_rank}"
+            )
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+                logger.warning(
+                    f"[NSA_SPLIT_DIAG] pp_rank={self.pp_group.rank_in_group} "
+                    f"hidden_states.shape_after_split={hidden_states.shape}"
+                )
             positions = cp_split_and_rebuild_position(forward_batch, positions)
         # llama_4_scaling: for supporting Mistral-Large-3 model
         # Compute llama 4 scaling once per forward pass if enabled
@@ -3913,9 +3923,18 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self.nsa_enable_prefill_cp:
-            if can_nsa_cp_split(
+            can_split = can_nsa_cp_split(
                 len(input_ids), self.cp_size, self.use_nsa, forward_batch
-            ):
+            )
+            logger.warning(
+                f"[PP_CP_METADATA_DIAG] pp_rank={self.pp_group.rank_in_group} "
+                f"is_first_rank={self.pp_group.is_first_rank} "
+                f"len(input_ids)={len(input_ids)} "
+                f"can_nsa_cp_split={can_split} "
+                f"forward_mode={forward_batch.forward_mode} "
+                f"attn_cp_metadata={'SET' if can_split else 'NONE'}"
+            )
+            if can_split:
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
                     self.cp_rank,
