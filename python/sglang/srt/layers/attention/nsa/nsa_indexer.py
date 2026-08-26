@@ -316,6 +316,36 @@ class Indexer(MultiPlatformOp):
             forward_batch.token_to_kv_pool, "use_fp8_index_k_cache", True
         )
 
+    def _cp_align_index_store(
+        self, forward_batch: ForwardBatch, key: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Align the indexer K tensor and its destination slots to the real
+        unpadded token count before an index-K cache store.
+
+        In PP-disagg-prefill + NSA context-parallel round-robin, ``key`` finishes
+        the CP all-gather (``cp_all_gather_rerange_output``) with shape
+        ``[real_N, ...]`` -- exactly the pre-split token count. But
+        ``forward_batch.out_cache_loc`` was tail-padded with value 0 to the
+        DP MLP-sync ``num_tokens`` in ``prepare_mlp_sync_batch``. The two lengths
+        then disagree at the store site (``set_index_k_buffer`` /
+        ``fuse_*_and_store_index_k_cache``), which either raises a broadcast
+        shape mismatch or -- worse -- silently writes surplus rows into slot 0
+        (the value-0 padding target). Slicing both tensors to real_N stores every
+        real key into its real slot and never touches the slot-0 padding rows.
+
+        No-op when the lengths already match (the common non-CP path).
+        """
+        loc = forward_batch.out_cache_loc
+        if loc.shape[0] == key.shape[0]:
+            return key, loc
+        if forward_batch.extend_seq_lens_cpu is not None:
+            real_n = int(sum(forward_batch.extend_seq_lens_cpu))
+        else:
+            real_n = min(key.shape[0], loc.shape[0])
+        # Clamp: never index past either present buffer.
+        real_n = min(real_n, key.shape[0], loc.shape[0])
+        return key[:real_n], loc[:real_n]
+
     def _get_gate_input_tensor(
         self, x: torch.Tensor | tuple[torch.Tensor, ...]
     ) -> torch.Tensor:
@@ -1333,13 +1363,17 @@ class Indexer(MultiPlatformOp):
         Fallback : act_quant(key) + token_to_kv_pool.set_index_k_scale_buffer(...)
         """
 
+        # Align key and its destination slots to the real unpadded token count
+        # once; all sub-paths below index against the local out_cache_loc.
+        key, out_cache_loc = self._cp_align_index_store(forward_batch, key)
+
         # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
         if (
             _is_cuda
             and (not _is_fp8_fnuz)
             and can_use_nsa_fused_store(
                 key.dtype,
-                forward_batch.out_cache_loc.dtype,
+                out_cache_loc.dtype,
                 forward_batch.token_to_kv_pool.page_size,
             )
         ):
@@ -1350,7 +1384,7 @@ class Indexer(MultiPlatformOp):
             fused_store_index_k_cache(
                 key,
                 buf,
-                forward_batch.out_cache_loc,
+                out_cache_loc,
                 forward_batch.token_to_kv_pool.page_size,
             )
             return
@@ -1366,7 +1400,7 @@ class Indexer(MultiPlatformOp):
                 layer_id=layer_id
             )
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
-            out_loc = forward_batch.out_cache_loc
+            out_loc = out_cache_loc
             if not out_loc.is_contiguous():
                 out_loc = out_loc.contiguous()
             indexer_k_quant_and_cache(
@@ -1383,7 +1417,7 @@ class Indexer(MultiPlatformOp):
             if self._use_hcu_bf16_index_cache(forward_batch):
                 forward_batch.token_to_kv_pool.set_index_k_buffer(
                     layer_id=layer_id,
-                    loc=forward_batch.out_cache_loc,
+                    loc=out_cache_loc,
                     index_k=key,
                 )
                 return
@@ -1394,7 +1428,7 @@ class Indexer(MultiPlatformOp):
             lightop_kvcache.fuse_act_quant_and_store_index_k_cache(
                 key,  # input
                 buf,  # buf
-                forward_batch.out_cache_loc,  # loc
+                out_cache_loc,  # loc
                 forward_batch.token_to_kv_pool.page_size,  # page_size
                 1e-5,  # eps
                 False,  # use_ue8m0
@@ -1405,7 +1439,7 @@ class Indexer(MultiPlatformOp):
         assert act_quant is not None
         k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
-        out_loc = forward_batch.out_cache_loc
+        out_loc = out_cache_loc
         if not out_loc.is_contiguous():
             out_loc = out_loc.contiguous()
 
@@ -1499,9 +1533,10 @@ class Indexer(MultiPlatformOp):
                     q_index, key = self._get_q_k_bf16(
                         q_lora, x, positions, False, forward_batch=forward_batch
                     )
+                    key, k_loc = self._cp_align_index_store(forward_batch, key)
                     forward_batch.token_to_kv_pool.set_index_k_buffer(
                         layer_id=layer_id,
-                        loc=forward_batch.out_cache_loc,
+                        loc=k_loc,
                         index_k=key,
                     )
                     weights = self._get_bf16_logits_head_gate(x)
@@ -1520,7 +1555,7 @@ class Indexer(MultiPlatformOp):
                             layer_id=layer_id
                         )
                     )
-                    k_loc = forward_batch.out_cache_loc
+                    key, k_loc = self._cp_align_index_store(forward_batch, key)
                     page_size = forward_batch.token_to_kv_pool.page_size
                     is_e4m3 = not _is_fp8_fnuz
 
@@ -1578,17 +1613,19 @@ class Indexer(MultiPlatformOp):
                         enable_dual_stream if not _is_hcu else False,
                         forward_batch=forward_batch,
                     )
-                    logger.warning(
-                        f"[NSA_STORE_DIAG] layer_id={layer_id} "
-                        f"key.shape={key.shape} "
-                        f"out_cache_loc.shape={forward_batch.out_cache_loc.shape} "
-                        f"attn_cp_metadata={'SET' if forward_batch.attn_cp_metadata is not None else 'NONE'} "
-                        f"nsa_enable_prefill_cp={self.nsa_enable_prefill_cp} "
-                        f"gather_guard={forward_batch.attn_cp_metadata is not None and self.nsa_enable_prefill_cp}"
-                    )
+                    key, k_loc = self._cp_align_index_store(forward_batch, key)
+                    if k_loc.shape[0] != forward_batch.out_cache_loc.shape[0]:
+                        logger.warning(
+                            "[NSA_CP_ALIGN] layer_id=%s trimmed out_cache_loc %s -> %s "
+                            "to match key %s",
+                            layer_id,
+                            forward_batch.out_cache_loc.shape[0],
+                            k_loc.shape[0],
+                            tuple(key.shape),
+                        )
                     forward_batch.token_to_kv_pool.set_index_k_buffer(
                         layer_id=layer_id,
-                        loc=forward_batch.out_cache_loc,
+                        loc=k_loc,
                         index_k=key,
                     )
                 else:
@@ -1605,7 +1642,7 @@ class Indexer(MultiPlatformOp):
                             layer_id=layer_id
                         )
                     )
-                    k_loc = forward_batch.out_cache_loc
+                    key, k_loc = self._cp_align_index_store(forward_batch, key)
                     page_size = forward_batch.token_to_kv_pool.page_size
                     is_e4m3 = not _is_fp8_fnuz
 
@@ -1931,9 +1968,8 @@ class Indexer(MultiPlatformOp):
                 torch.npu.current_stream(),
             )
 
-        forward_batch.token_to_kv_pool.set_index_k_buffer(
-            layer_id, forward_batch.out_cache_loc, k
-        )
+        k, k_loc = self._cp_align_index_store(forward_batch, k)
+        forward_batch.token_to_kv_pool.set_index_k_buffer(layer_id, k_loc, k)
         if is_prefill:
             if (
                 self.nsa_enable_prefill_cp
