@@ -3674,6 +3674,34 @@ class DeepseekV2Model(nn.Module):
                     f"hidden_states.shape_after_split={hidden_states.shape}"
                 )
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+            # NSA-CP + PP: `hidden_states` on non-first ranks arrives already
+            # CP-split from the producing rank (carried via pp_proxy_tensors),
+            # while `positions` is rebuilt from the *local* forward_batch. When
+            # the two ranks padded their micro-batch to different num_tokens
+            # (the per-step global max-len can differ by a page across pipeline
+            # stages), the two split lengths diverge purely in the trailing
+            # padding region. Round-robin split assigns by absolute token index,
+            # so every real token's position is identical in both worldlines;
+            # only the pad tail differs. Align `positions` to `hidden_states`
+            # (pad tail with zeros / trim) so rotary sees matching token counts.
+            n_hidden = hidden_states.shape[0]
+            n_pos = positions.shape[0]
+            if n_pos != n_hidden:
+                logger.warning(
+                    f"[NSA_CP_POS_ALIGN] pp_rank={self.pp_group.rank_in_group} "
+                    f"is_first_rank={self.pp_group.is_first_rank} "
+                    f"aligned positions {n_pos} -> {n_hidden} "
+                    f"to match hidden_states"
+                )
+                if n_pos > n_hidden:
+                    positions = positions[:n_hidden]
+                else:
+                    positions = torch.cat(
+                        [
+                            positions,
+                            positions.new_zeros(n_hidden - n_pos),
+                        ]
+                    )
         # llama_4_scaling: for supporting Mistral-Large-3 model
         # Compute llama 4 scaling once per forward pass if enabled
         llama_4_scaling: Optional[torch.Tensor] = None
