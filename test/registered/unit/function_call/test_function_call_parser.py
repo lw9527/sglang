@@ -2258,6 +2258,54 @@ class TestDeepSeekV4Detector(unittest.TestCase):
         self.assertEqual(tool_calls_by_index[0]["name"], "submit")
         self.assertEqual(json.loads(tool_calls_by_index[0]["parameters"]), {})
 
+    def test_streaming_normal_text_before_tool_call_is_preserved(self):
+        """Prose that precedes the tool-call block must be emitted as content.
+
+        Regression: the model streams a trailing text token and the
+        `<｜DSML｜tool_calls>` tag close together, so the leading prose lands in
+        the same buffer as the tool-call start. The streaming parser used to
+        jump straight into invoke matching and drop that prose entirely.
+        """
+        preface = "我来帮你准备。让我先加载相关技能和查询知识库。\n\n"
+        text = (
+            preface + "<｜DSML｜tool_calls>\n"
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">\n'
+            '<｜DSML｜parameter name="city" string="true">合肥</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>"
+        )
+        self.detector = DeepSeekV4Detector()
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunks = [
+            self.tokenizer.decode(input_ids[i : i + self.interval])
+            for i in range(0, len(input_ids), self.interval)
+        ]
+
+        normal_text = ""
+        tool_calls_by_index = {}
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            if result.normal_text:
+                normal_text += result.normal_text
+            for call in result.calls:
+                if call.tool_index is None:
+                    continue
+                slot = tool_calls_by_index.setdefault(
+                    call.tool_index, {"name": "", "parameters": ""}
+                )
+                if call.name:
+                    slot["name"] = call.name
+                if call.parameters:
+                    slot["parameters"] += call.parameters
+
+        # The full preface (minus the trailing blank line that separates it
+        # from the tool-call block) must survive.
+        self.assertEqual(normal_text, preface.removesuffix("\n\n"))
+        self.assertEqual(len(tool_calls_by_index), 1)
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
+        params = json.loads(tool_calls_by_index[0]["parameters"])
+        self.assertEqual(params["city"], "合肥")
+
 
 class TestQwen3CoderDetector(unittest.TestCase):
     """Test suite for Qwen3CoderDetector."""

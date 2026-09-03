@@ -92,6 +92,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.prefix_parameter_end_call = ["</", "｜DSML｜", "parameter"]
         self.prefix_invoke_end_call = ["</", "｜DSML｜", "inv", "oke"]
         self.current_tool_id = -1
+        # True once the DSML tool-call region has started. Guards the
+        # leading-normal-text split so that whitespace/newlines *between*
+        # invoke blocks (which look like text preceding an invoke) are not
+        # re-emitted as assistant content.
+        self._in_tool_region = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -258,6 +263,32 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     current_text = current_text.replace(e_token, "")
             return StreamingParseResult(normal_text=current_text)
 
+        # Split off any prose that precedes the DSML tool-call region so it is
+        # emitted as assistant content instead of being swallowed. The model
+        # commonly streams the trailing text token and the `<｜DSML｜...` tag in
+        # the same decode step, so both land in the buffer together; without
+        # this split the leading text is lost when the invoke block is consumed.
+        # Once inside the tool region, whitespace between invoke blocks looks
+        # like leading text too, so guard with `_in_tool_region`.
+        normal_text_out = ""
+        if not self._in_tool_region:
+            split_idx = current_text.find("<｜DSML｜")
+            if split_idx == -1:
+                # No complete tag yet: emit everything before a partial trailing
+                # DSML prefix and keep that (possibly partial) prefix buffered.
+                partial_len = self._ends_with_partial_token(current_text, "<｜DSML｜")
+                if partial_len:
+                    self._buffer = current_text[-partial_len:]
+                    return StreamingParseResult(normal_text=current_text[:-partial_len])
+                self._buffer = ""
+                return StreamingParseResult(normal_text=current_text)
+
+            if split_idx > 0:
+                normal_text_out = current_text[:split_idx].removesuffix("\n\n")
+            current_text = current_text[split_idx:]
+            self._buffer = current_text
+            self._in_tool_region = True
+
         all_calls: list[ToolCallItem] = []
         try:
             # Loop to handle multiple consecutive invoke blocks
@@ -355,11 +386,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     break
 
             # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+            return StreamingParseResult(normal_text=normal_text_out, calls=all_calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=normal_text_out + current_text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
