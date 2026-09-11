@@ -459,8 +459,13 @@ def _apply_wo_a_bf16_matmul(
     is_prefill: bool = False,
     fast_path: bool = False,
 ) -> torch.Tensor | Mxfp8SwizzledInput:
-    # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
-    # on the exact validated TP4 shapes and write token-major output directly.
+    """Compute bf16 wo_a: o [T, G, D] @ wo_a [G, R, D] -> [T, G, R].
+
+    Single-token decode uses a GEMV for the validated TP4/TP8 shapes. Blackwell
+    verify batches up to 384 rows write token-major output directly to avoid
+    the layout copy before wo_b. ROCm decode can use aiter batched GEMM;
+    other cases use torch.einsum.
+    """
     global _wo_a_aiter_batched_gemm_disabled
     if (
         fast_path
@@ -482,12 +487,13 @@ def _apply_wo_a_bf16_matmul(
                 and get_platform().is_blackwell
             )
         )
-        and o.shape[1:] == (2, 4096)
-        and wo_a.shape == (2, 1024, 4096)
+        and o.shape[2] == 4096
+        and o.shape[1] in (1, 2)
+        and wo_a.shape == (o.shape[1], 1024, 4096)
         and o.dtype == wo_a.dtype == torch.bfloat16
         and o.stride(2) == 1
         and o.stride(1) == 4096
-        and o.stride(0) >= 8192
+        and o.stride(0) >= 4096 * o.shape[1]
         and wo_a.is_contiguous()
     ):
         if is_decode and o.shape[0] == 1:
