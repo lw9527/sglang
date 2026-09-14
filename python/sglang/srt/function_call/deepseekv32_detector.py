@@ -6,6 +6,7 @@ from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -16,6 +17,15 @@ from sglang.srt.function_call.core_types import (
 from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_loads
 
 logger = logging.getLogger(__name__)
+_JSON_DECODER = json.JSONDecoder()
+
+
+class MalformedDSMLToolCall(ValueError):
+    """A complete invoke body that is not well-formed DSML: a parameter tag
+    without the DSML marker or the ``string`` attribute, a truncated or
+    non-object JSON body, stray text. Raised only under strict parsing
+    (``SGLANG_ENABLE_STRICT_DSML_TOOL_CALLS``); the callers drop the call and
+    forward the text as content."""
 
 
 class DeepSeekV32Detector(BaseFormatDetector):
@@ -67,6 +77,17 @@ class DeepSeekV32Detector(BaseFormatDetector):
     - Parameters: Either XML tags or direct JSON format
     - Supports multiple tool calls
 
+    Strict parsing (``SGLANG_ENABLE_STRICT_DSML_TOOL_CALLS=1``, off by default):
+    a complete invoke body must be well-formed (every non-blank character inside
+    a matched parameter tag, or one JSON object), like the vendor parser
+    requires. A malformed body drops the call and forwards the text as content
+    with a warning instead of parsing as ``{}``; in streaming the tool name
+    travels in the same delta as the first argument bytes and the arguments
+    stay incomplete JSON until the closer validates the body, so a client
+    never holds a name with empty arguments or a complete call the one-shot
+    path would refuse, and a malformed invoke turns the rest of its calls
+    block into content.
+
     Reference: DeepSeek V3.2 format specification
     """
 
@@ -105,6 +126,16 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.prefix_parameter_end_call = ["</", "｜DSML｜", "parameter"]
         self.prefix_invoke_end_call = ["</", "｜DSML｜", "inv", "oke"]
         self.current_tool_id = -1
+        self.strict = envs.SGLANG_ENABLE_STRICT_DSML_TOOL_CALLS.get()
+        # Strict streaming state. _pending_params: partial arguments of a call
+        # whose name has not gone out yet (nothing is tracked for it, so a cut
+        # stream leaves nothing to back-fill). _poisoned_block: a malformed
+        # invoke was dropped and the rest of its calls block is content.
+        # _trimmed_separator: the "\n\n" trimmed off the preamble, re-emitted
+        # if the block is dropped in a later pass.
+        self._pending_params = None
+        self._poisoned_block = False
+        self._trimmed_separator = ""
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -124,6 +155,27 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return name, "", True
         return name, m.group("body"), bool(m.group("end"))
 
+    @staticmethod
+    def _require_json_object(body: str) -> None:
+        try:
+            json.loads(body)
+        except (json.JSONDecodeError, ValueError) as e:
+            raise MalformedDSMLToolCall(f"invalid JSON body: {e}") from e
+
+    @staticmethod
+    def _hold_json_close(prefix: str) -> str:
+        """The longest start of ``prefix`` that does not begin with a complete
+        JSON value. Strict streaming sends this instead of ``prefix`` on a
+        partial pass, so what a client holds for a call stays incomplete JSON
+        until the closer arrives and the body passes validation; the character
+        that completes the object, and any text the body carries after it, go
+        out with the closer or not at all."""
+        try:
+            _, end = _JSON_DECODER.raw_decode(prefix)
+        except json.JSONDecodeError:
+            return prefix
+        return prefix[: end - 1]
+
     def _parse_parameters_from_xml(
         self, invoke_content: str, allow_partial: bool = False
     ) -> str:
@@ -133,6 +185,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
         Supports two formats:
         1. XML parameter tags: <｜DSML｜parameter name="..." string="...">value</｜DSML｜parameter>
         2. Direct JSON: { "key": "value" }
+
+        Under strict parsing a complete body raises MalformedDSMLToolCall unless
+        it is one JSON object or every non-blank character sits inside a
+        matched parameter tag.
         """
         # First, try to parse as direct JSON (new format)
         invoke_content_stripped = invoke_content.strip()
@@ -148,6 +204,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     )
                 return invoke_content_stripped
             elif invoke_content_stripped.endswith("}"):
+                if self.strict:
+                    self._require_json_object(invoke_content_stripped)
                 return invoke_content_stripped
 
         # Fall back to XML parameter tag parsing (original format)
@@ -158,7 +216,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
         )
 
         last_match_end = 0
+        unparsed = []  # body text outside the matched parameter tags
         for match in param_matches:
+            unparsed.append(invoke_content[last_match_end : match.start()])
             param_name = match.group(1)
             param_type = match.group(2)
             param_value = match.group(3)
@@ -200,6 +260,16 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         )[0]
                     except (json.JSONDecodeError, MalformedJSON, ValueError):
                         parameters[param_name] = param_value.strip()
+        elif self.strict:
+            # A tag without the DSML marker or the string attribute, a truncated
+            # JSON body or prose would otherwise parse as `{}`, an executable
+            # zero-argument call; an empty or blank body still is one.
+            unparsed.append(invoke_content[last_match_end:])
+            leftover = "".join(unparsed).strip()
+            if leftover:
+                raise MalformedDSMLToolCall(
+                    f"unparsed text inside the invoke body: {leftover[:80]!r}"
+                )
 
         return json.dumps(parameters, ensure_ascii=False)
 
@@ -230,7 +300,17 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     func_name, invoke_content, _ = self._unpack_invoke_match(
                         invoke_match
                     )
-                    func_args = self._parse_parameters_from_xml(invoke_content)
+                    try:
+                        func_args = self._parse_parameters_from_xml(invoke_content)
+                    except MalformedDSMLToolCall as e:
+                        # Atomic: no call of the turn survives, the client gets
+                        # the text and finish_reason "stop".
+                        logger.warning(
+                            "Malformed DSML tool call for %s dropped; forwarding the turn as text: %s",
+                            func_name,
+                            e,
+                        )
+                        return StreamingParseResult(normal_text=text)
                     # construct match_result for parse_base_json
                     match_result = {
                         "name": func_name,
@@ -244,6 +324,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
             # return the normal text if parsing fails
             return StreamingParseResult(normal_text=text)
 
+    def _ensure_tool_slots(self) -> None:
+        while len(self.prev_tool_call_arr) <= self.current_tool_id:
+            self.prev_tool_call_arr.append({})
+        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+            self.streamed_args_for_tool.append("")
+
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]
     ) -> StreamingParseResult:
@@ -253,6 +339,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
         """
         self._buffer += new_text
         current_text = self._buffer
+
+        if self._poisoned_block:
+            return self._forward_poisoned_block(current_text, tools)
 
         # Check if buffer contains any DSML tool-call markers or ends with a
         # partial tag prefix.  Use specific tool-call tags instead of bare
@@ -277,6 +366,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
             and not potentially_dsml
             and not ends_with_prefix
         ):
+            if self.strict and not current_text.strip():
+                # Whitespace ahead of a possible calls block (the "\n\n" the
+                # encoder puts before it) is held, not sent as its own content
+                # delta; the preamble trim consumes it or finish() releases it.
+                return StreamingParseResult()
             self._buffer = ""
             for e_token in [self.eot_token, self.invoke_end_token]:
                 if e_token in current_text:
@@ -286,7 +380,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
         all_calls: list[ToolCallItem] = []
         # Only recovered for the first call: the DSML guard above never releases a
         # buffer that still holds a marker, so later prose stays buffered.
+        # raw_head is the same text before the "\n\n" trim, for a strict drop.
         preamble = ""
+        raw_head = ""
         try:
             # Loop to handle multiple consecutive invoke blocks
             while True:
@@ -303,59 +399,102 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     invoke_match
                 )
 
+                # Where this call's wire text starts: the calls-block opener when
+                # it is still buffered (first call of a block), else the invoke.
+                block_start = invoke_match.start()
+                bot_pos = current_text.rfind(self.bot_token, 0, block_start)
+                if bot_pos != -1:
+                    block_start = bot_pos
+
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
                     self.current_tool_id = 0
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
-                    call_start = invoke_match.start()
-                    bot_pos = current_text.rfind(self.bot_token, 0, call_start)
-                    if bot_pos != -1:
-                        call_start = bot_pos
                     # Same trailing-newline trim as detect_and_parse, so both agree.
-                    preamble = current_text[:call_start].removesuffix("\n\n")
+                    raw_head = current_text[:block_start]
+                    preamble = raw_head.removesuffix("\n\n")
+                    self._trimmed_separator = raw_head[len(preamble) :]
 
-                # Ensure arrays are large enough for current tool
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
-
-                # 1. Send tool name if not sent yet
-                if not self.current_tool_name_sent:
-                    all_calls.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=func_name,
-                            parameters="",
+                if not self.strict:
+                    self._ensure_tool_slots()
+                    # 1. Send tool name if not sent yet
+                    if not self.current_tool_name_sent:
+                        all_calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=func_name,
+                                parameters="",
+                            )
                         )
-                    )
-                    self.current_tool_name_sent = True
+                        self.current_tool_name_sent = True
 
                 # 2. Parse current parameters (partial or complete)
-                current_params = self._parse_parameters_from_xml(
-                    invoke_content, allow_partial=not is_tool_end
-                )
+                try:
+                    current_params = self._parse_parameters_from_xml(
+                        invoke_content, allow_partial=not is_tool_end
+                    )
+                except MalformedDSMLToolCall as e:
+                    # The untrimmed preamble when this pass recovered it, else
+                    # the separator an earlier pass trimmed off the one it sent.
+                    head = raw_head or self._trimmed_separator
+                    self._trimmed_separator = ""
+                    return self._drop_malformed_streaming_call(
+                        func_name=func_name,
+                        error=e,
+                        preamble=head,
+                        raw_block=current_text[block_start:],
+                        earlier_calls=all_calls,
+                        tools=tools,
+                    )
 
                 # 3. Calculate and send incremental arguments
-                sent_len = len(self.streamed_args_for_tool[self.current_tool_id])
-                prev_params = self.prev_tool_call_arr[self.current_tool_id].get(
-                    "arguments"
-                )
+                if self.current_tool_name_sent:
+                    sent_len = len(self.streamed_args_for_tool[self.current_tool_id])
+                    prev_params = self.prev_tool_call_arr[self.current_tool_id].get(
+                        "arguments"
+                    )
+                else:
+                    # Strict: nothing is tracked for the call until its name goes out.
+                    sent_len = 0
+                    prev_params = self._pending_params
 
                 argument_diff = None
 
                 if is_tool_end:
                     # If complete, send everything remaining
                     argument_diff = current_params[sent_len:]
-                elif prev_params is not None:
+                elif prev_params is not None and current_params != prev_params:
                     # If partial, send stable prefix diff
-                    if current_params != prev_params:
-                        prefix = _find_common_prefix(current_params, prev_params)
-                        if len(prefix) > sent_len:
-                            argument_diff = prefix[sent_len:]
+                    prefix = _find_common_prefix(current_params, prev_params)
+                    if self.strict:
+                        # A body can be a complete JSON object followed by
+                        # text the closer will reject; the arguments stay
+                        # incomplete until the body is validated end to end.
+                        prefix = self._hold_json_close(prefix)
+                    if len(prefix) > sent_len:
+                        argument_diff = prefix[sent_len:]
 
-                if argument_diff:
+                if not self.current_tool_name_sent:
+                    # Strict: the name goes out in the same item as the first
+                    # non-empty argument delta (the whole body at the closer,
+                    # "{}" at the least), so a client never holds a name with
+                    # "" arguments, which it would execute as a zero-argument
+                    # call if the stream is cut or the close is malformed.
+                    if not argument_diff and not is_tool_end:
+                        self._pending_params = current_params
+                        break
+                    self._ensure_tool_slots()
+                    all_calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=func_name,
+                            parameters=argument_diff,
+                        )
+                    )
+                    self.current_tool_name_sent = True
+                    self._pending_params = None
+                elif argument_diff:
                     all_calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
@@ -363,6 +502,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
                             parameters=argument_diff,
                         )
                     )
+
+                if argument_diff:
                     self.streamed_args_for_tool[self.current_tool_id] += argument_diff
 
                 # Update the stored arguments
@@ -376,6 +517,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     # Remove the completed tool call from buffer
                     self._buffer = current_text[invoke_match.end() :]
                     current_text = self._buffer  # Update for next iteration
+                    self._trimmed_separator = ""
 
                     # Move to next tool call
                     self.current_tool_id += 1
@@ -393,6 +535,19 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
+            if self.strict:
+                # Re-emit verbatim rather than swallowing the turn; the preamble
+                # is still inside current_text unless a completed call advanced
+                # past it.  Calls are dropped on purpose: the failure can land
+                # between a tool's name and its arguments, and a half-formed
+                # call is worse than none.
+                self._buffer = ""
+                self._pending_params = None
+                self._poisoned_block = False
+                self._trimmed_separator = ""
+                if not current_text.startswith(preamble):
+                    current_text = preamble + current_text
+                return StreamingParseResult(normal_text=current_text)
             # Do NOT clear self._buffer — retaining it lets the next chunk
             # retry parsing with more data.  Reset transient tool state so
             # a partial parse doesn't corrupt the next attempt.
@@ -402,37 +557,113 @@ class DeepSeekV32Detector(BaseFormatDetector):
             self.streamed_args_for_tool = [""]
             return StreamingParseResult(normal_text=preamble)
 
-    def finish(self, tools: list[Tool]) -> StreamingParseResult:
-        """Flush any text trapped in the buffer when the stream ends.
+    def _drop_malformed_streaming_call(
+        self,
+        func_name: str,
+        error: MalformedDSMLToolCall,
+        preamble: str,
+        raw_block: str,
+        earlier_calls: list[ToolCallItem],
+        tools: list[Tool],
+    ) -> StreamingParseResult:
+        """Strict streaming drop: the call's wire text becomes content, the
+        rest of its calls block is poisoned, calls completed earlier in the
+        pass are kept, and nothing is left for the serving layer to back-fill.
 
-        If the buffer contains DSML markers but no invoke was ever matched
-        (e.g. a DSML sub-tag appeared in response text), the text was never
-        flushed as normal_text.  This method returns it so the client
-        receives the content instead of silently losing it.
-
-        DSML tool-call tags (e.g. <｜DSML｜tool_calls>) are delimiters, not
-        content — they are stripped from the flushed text to prevent leaking
-        raw markup into the response.
+        A name that already went out cannot be recalled; its tracked arguments
+        are pinned to the streamed prefix (unparsable JSON, never `{}`).
         """
-        if not self._buffer:
-            return StreamingParseResult()
-        buffered = self._buffer
+        logger.warning(
+            "Malformed DSML tool call for %s dropped; forwarding the block as text: %s",
+            func_name,
+            error,
+        )
+        self._pending_params = None
+        if self.current_tool_name_sent:
+            self.prev_tool_call_arr[self.current_tool_id] = {
+                "name": func_name,
+                "arguments": self.streamed_args_for_tool[self.current_tool_id],
+            }
+            self.current_tool_id += 1
+            self.current_tool_name_sent = False
+        else:
+            del self.prev_tool_call_arr[self.current_tool_id :]
+            del self.streamed_args_for_tool[self.current_tool_id :]
+        self._poisoned_block = True
+        forwarded = self._forward_poisoned_block(raw_block, tools)
+        return StreamingParseResult(
+            normal_text=preamble + forwarded.normal_text,
+            calls=earlier_calls + forwarded.calls,
+        )
+
+    def _forward_poisoned_block(
+        self, current_text: str, tools: list[Tool]
+    ) -> StreamingParseResult:
+        """Content up to and including the calls-block closer; the text after
+        it goes back through parse_streaming_increment. Without the closer,
+        everything but a suffix that could be the start of it is forwarded."""
+        end = current_text.find(self.eot_token)
+        if end == -1:
+            hold = self._ends_with_partial_token(current_text, self.eot_token)
+            keep = len(current_text) - hold
+            self._buffer = current_text[keep:]
+            return StreamingParseResult(normal_text=current_text[:keep])
+        cut = end + len(self.eot_token)
         self._buffer = ""
-        # If we successfully parsed tool calls, the buffer holds only
-        # trailing whitespace or closing tags — don't emit those.
-        if self.current_tool_id != -1 and self.prev_tool_call_arr:
-            return StreamingParseResult()
-        # No tool calls were parsed — the buffer is trapped text.
-        # Strip everything from the earliest DSML tool-call tag onward:
-        # tags are delimiters, not content.  Use _DSML_TOOL_TAGS (without
-        # ">") so partial tags like "<｜DSML｜tool_calls" are also stripped.
-        earliest = len(buffered)
-        for tag in self._DSML_TOOL_TAGS:
-            idx = buffered.find(tag)
-            if idx != -1 and idx < earliest:
-                earliest = idx
-        buffered = buffered[:earliest]
-        return StreamingParseResult(normal_text=buffered)
+        self._poisoned_block = False
+        normal_text, calls = current_text[:cut], []
+        if current_text[cut:]:
+            rest = self.parse_streaming_increment(current_text[cut:], tools)
+            normal_text += rest.normal_text
+            calls = rest.calls
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def finish(self, tools: list[Tool]) -> StreamingParseResult:
+        """Flush text trapped in the buffer when the stream ends.
+
+        Default mode: if the buffer holds DSML markers but no invoke was ever
+        matched (e.g. a DSML sub-tag appeared in response text), the text was
+        never flushed as normal_text, so return it instead of silently losing
+        it.  DSML tool-call tags are delimiters, not content — they are
+        stripped to prevent leaking raw markup into the response.
+
+        Strict mode: release text held for a marker that can no longer come
+        (whitespace, a stray "<", the tail of a poisoned block). Text holding a
+        DSML marker (an unterminated calls block) stays dropped, as in
+        detect_and_parse."""
+        if not self.strict:
+            if not self._buffer:
+                return StreamingParseResult()
+            buffered = self._buffer
+            self._buffer = ""
+            # If we successfully parsed tool calls, the buffer holds only
+            # trailing whitespace or closing tags — don't emit those.
+            if self.current_tool_id != -1 and self.prev_tool_call_arr:
+                return StreamingParseResult()
+            # No tool calls were parsed — the buffer is trapped text.
+            # Strip everything from the earliest DSML tool-call tag onward:
+            # tags are delimiters, not content.  Use _DSML_TOOL_TAGS (without
+            # ">") so partial tags like "<｜DSML｜tool_calls" are also stripped.
+            earliest = len(buffered)
+            for tag in self._DSML_TOOL_TAGS:
+                idx = buffered.find(tag)
+                if idx != -1 and idx < earliest:
+                    earliest = idx
+            buffered = buffered[:earliest]
+            return StreamingParseResult(normal_text=buffered)
+        held, self._buffer = self._buffer, ""
+        self._pending_params = None
+        self._trimmed_separator = ""
+        if self._poisoned_block:
+            self._poisoned_block = False
+            return StreamingParseResult(normal_text=held)
+        if (
+            held
+            and not self.has_tool_call(held)
+            and not any(marker in held for marker in ("｜DSML｜", "<｜", "</｜"))
+        ):
+            return StreamingParseResult(normal_text=held)
+        return StreamingParseResult()
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
